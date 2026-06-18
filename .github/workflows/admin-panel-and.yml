@@ -1,0 +1,256 @@
+name: Build Admin Panel - Android
+
+on:
+  repository_dispatch:
+    types: [build-adminpanel-android]
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repo to clone (e.g. username/repo-name)'
+        required: true
+        type: string
+      branch:
+        description: 'Branch to build'
+        required: false
+        default: 'main'
+        type: string
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+
+      - name: Resolve source target
+        run: |
+          SOURCE_REPO="${{ github.event.inputs.source_repo || github.event.client_payload.source_repo || 'supulvinod/pro-nxt' }}"
+          SOURCE_BRANCH="${{ github.event.inputs.branch || github.event.client_payload.branch || 'main' }}"
+          echo "SOURCE_REPO=$SOURCE_REPO" >> "$GITHUB_ENV"
+          echo "SOURCE_BRANCH=$SOURCE_BRANCH" >> "$GITHUB_ENV"
+          echo "Using source: $SOURCE_REPO@$SOURCE_BRANCH (releases upload to source repo)"
+      - name: Update build status
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          PENDING_ID="${{ github.event.client_payload.pending_id }}"
+          if [ -z "$PENDING_ID" ]; then
+            PENDING_ID="build-adminpanel-android-pending-${GITHUB_RUN_ID}"
+            curl -s -X PUT "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{\"id\":\"${PENDING_ID}\",\"platform\":\"android\",\"app\":\"admin-panel\",\"status\":\"building\",\"createdAt\":$(date +%s000),\"runId\":\"${GITHUB_RUN_ID}\",\"source\":\"workflow\"}" &
+          else
+            curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{\"runId\":\"${GITHUB_RUN_ID}\",\"workflowStarted\":$(date +%s000)}" &
+          fi
+          echo "PENDING_ID=$PENDING_ID" >> $GITHUB_ENV
+
+      # ----- Clean up old Admin Panel Android build releases -----
+      - name: Clean up old Admin Panel Android build releases
+        env:
+          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d "{\"step\":\"cleanup\",\"text\":\"🗑️ Cleaning up old releases...\",\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+
+          PUBLIC_REPO="${SOURCE_REPO}"
+
+          echo "🗑️ Cleaning up old Admin Panel Android build releases from ${PUBLIC_REPO}..."
+          OLD_RELEASES=$(curl -s \
+            -H "Authorization: token $PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/releases?per_page=100")
+
+          echo "$OLD_RELEASES" | jq -r '.[] | select(.tag_name | startswith("adminpanel-android-build-")) | "\(.id) \(.tag_name)"' | while read RELEASE_ID RELEASE_TAG; do
+            echo "  Deleting release: $RELEASE_TAG"
+            curl -s -X DELETE \
+              -H "Authorization: token $PAT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${PUBLIC_REPO}/releases/${RELEASE_ID}"
+            curl -s -X DELETE \
+              -H "Authorization: token $PAT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${PUBLIC_REPO}/git/refs/tags/${RELEASE_TAG}" 2>/dev/null || true
+
+            if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ]; then
+              BUILD_ID="build-${RELEASE_TAG}"
+              curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${BUILD_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+              echo "    Removed Firebase entry: ${BUILD_ID}"
+            fi
+          done
+
+          # Clean up orphaned Firebase entries and stale pending entries
+          if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ]; then
+            echo "🔍 Syncing Firebase buildReleases with GitHub..."
+            EXISTING_TAGS=$(echo "$OLD_RELEASES" | jq -r '.[].tag_name' 2>/dev/null || echo "")
+            FB_RELEASES=$(curl -s "${FIREBASE_DATABASE_URL}/buildReleases.json?auth=${FIREBASE_AUTH}&shallow=true" 2>/dev/null || echo "{}")
+            if [ "$FB_RELEASES" != "null" ] && [ "$FB_RELEASES" != "{}" ] && [ -n "$FB_RELEASES" ]; then
+              echo "$FB_RELEASES" | jq -r 'keys[]' 2>/dev/null | while read FB_ID; do
+                TAG_FROM_ID="${FB_ID#build-}"
+                if echo "$TAG_FROM_ID" | grep -q "^adminpanel-android-build-"; then
+                  if ! echo "$EXISTING_TAGS" | grep -qF "$TAG_FROM_ID"; then
+                    echo "  Removing orphaned Firebase entry: ${FB_ID}"
+                    curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${FB_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+                  fi
+                fi
+                if echo "$FB_ID" | grep -q "adminpanel.*android.*pending"; then
+                  ENTRY_DATA=$(curl -s "${FIREBASE_DATABASE_URL}/buildReleases/${FB_ID}.json?auth=${FIREBASE_AUTH}" 2>/dev/null)
+                  CREATED_AT=$(echo "$ENTRY_DATA" | jq -r '.createdAt // 0')
+                  NOW_MS=$(date +%s000)
+                  AGE_MS=$((NOW_MS - CREATED_AT))
+                  TWO_HOURS_MS=7200000
+                  if [ "$AGE_MS" -gt "$TWO_HOURS_MS" ]; then
+                    echo "  Removing stale pending entry: ${FB_ID} (age: $((AGE_MS / 60000)) minutes)"
+                    curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${FB_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+                    curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildLogs/${FB_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+                  fi
+                fi
+              done
+            fi
+          fi
+          echo "✅ Old releases cleaned up"
+
+      - name: Clone source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_BRANCH }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+          fetch-depth: 1
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Cache Flutter SDK
+        id: cache-flutter
+        uses: actions/cache@v4
+        with:
+          path: ~/flutter
+          key: flutter-stable-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Flutter
+        if: steps.cache-flutter.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/flutter/flutter.git -b stable --depth 1 $HOME/flutter
+
+      - name: Add Flutter to PATH
+        run: echo "$HOME/flutter/bin" >> $GITHUB_PATH
+
+      - name: Ensure Android project exists
+        working-directory: admin_panel
+        run: |
+          if [ ! -d "android" ]; then
+            echo "Android directory not found. Creating Android platform files..."
+            flutter create --platforms=android .
+          fi
+
+      - name: Write google-services.json
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          mkdir -p admin_panel/android/app
+          if [ ! -f "admin_panel/android/app/google-services.json" ]; then
+            if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+              echo "$GOOGLE_SERVICES_JSON" > admin_panel/android/app/google-services.json
+            else
+              echo "❌ google-services.json not found! Add GOOGLE_SERVICES_JSON secret."
+              exit 1
+            fi
+          fi
+
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            admin_panel/.dart_tool
+          key: pub-adminpanel-${{ runner.os }}-${{ hashFiles('admin_panel/pubspec.lock') }}
+
+      - name: Get Flutter dependencies
+        working-directory: admin_panel
+        run: flutter pub get
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-adminpanel-${{ runner.os }}-${{ hashFiles('admin_panel/android/build.gradle*') }}
+
+      - name: Build Flutter APK
+        working-directory: admin_panel
+        run: flutter build apk --release --no-tree-shake-icons
+
+      - name: Upload APK
+        env:
+          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          PUBLIC_REPO="${SOURCE_REPO}"
+          APK_PATH="admin_panel/build/app/outputs/flutter-apk/app-release.apk"
+          TAG="adminpanel-android-build-$(date +%Y%m%d-%H%M%S)"
+
+          if [ ! -f "$APK_PATH" ]; then
+            echo "❌ APK not found at $APK_PATH"
+            exit 1
+          fi
+
+          RELEASE_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/releases" \
+            -d "{\"tag_name\":\"${TAG}\",\"name\":\"Admin Panel Android ${TAG}\",\"body\":\"Admin Panel APK built by CI\",\"draft\":false,\"prerelease\":false}")
+
+          UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | grep -o '"upload_url": "[^"]*' | sed 's/"upload_url": "//' | sed 's/{.*//')
+          
+          if [ -n "$UPLOAD_URL" ]; then
+            UPLOAD_RESPONSE=$(curl -s -X POST \
+              -H "Authorization: token ${PAT}" \
+              -H "Content-Type: application/octet-stream" \
+              "${UPLOAD_URL}?name=AdminPanel.apk" \
+              --data-binary @"$APK_PATH")
+            DOWNLOAD_URL=$(echo "$UPLOAD_RESPONSE" | jq -r '.browser_download_url // empty')
+            echo "✅ APK uploaded: ${DOWNLOAD_URL}"
+          fi
+
+          RELEASE_URL="https://github.com/${PUBLIC_REPO}/releases/tag/${TAG}"
+          echo "BUILD_TAG=${TAG}" >> $GITHUB_ENV
+          echo "DOWNLOAD_URL=${DOWNLOAD_URL}" >> $GITHUB_ENV
+          echo "RELEASE_URL=${RELEASE_URL}" >> $GITHUB_ENV
+          echo "APK_SIZE=$(stat -c%s "$APK_PATH" 2>/dev/null || stat -f%z "$APK_PATH" 2>/dev/null || echo 0)" >> $GITHUB_ENV
+
+          COMMIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          COMMIT_MSG=$(git log -1 --pretty=%B 2>/dev/null | head -1 || echo "No commit message")
+
+          # Remove pending and add success entry
+          if [ -n "$PENDING_ID" ]; then
+            curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" &
+          fi
+          
+          BUILD_ID="build-${TAG}"
+          curl -s -X PUT "${FIREBASE_DATABASE_URL}/buildReleases/${BUILD_ID}.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"id\": \"${BUILD_ID}\",
+              \"platform\": \"android\",
+              \"app\": \"admin-panel\",
+              \"version\": \"${TAG}\",
+              \"downloadUrl\": \"${DOWNLOAD_URL}\",
+              \"releaseUrl\": \"${RELEASE_URL}\",
+              \"buildNumber\": \"${GITHUB_RUN_NUMBER:-0}\",
+              \"commitSha\": \"${COMMIT_SHA}\",
+              \"commitMessage\": $(echo "$COMMIT_MSG" | jq -Rs .),
+              \"createdAt\": $(date +%s000),
+              \"fileSizeBytes\": ${APK_SIZE:-0},
+              \"status\": \"success\"
+            }"

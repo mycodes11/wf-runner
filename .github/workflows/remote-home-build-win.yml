@@ -1,0 +1,526 @@
+name: Build Windows
+
+on:
+  repository_dispatch:
+    types: [build-windows]
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repo to clone (e.g. username/repo-name)'
+        required: true
+        type: string
+      branch:
+        description: 'Branch to build'
+        required: false
+        default: 'main'
+        type: string
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+
+      - name: Resolve source target
+        shell: bash
+        run: |
+          SOURCE_REPO="${{ github.event.inputs.source_repo || github.event.client_payload.source_repo || 'supulvinod/pro-nxt' }}"
+          SOURCE_BRANCH="${{ github.event.inputs.branch || github.event.client_payload.branch || 'main' }}"
+          echo "SOURCE_REPO=$SOURCE_REPO" >> "$GITHUB_ENV"
+          echo "SOURCE_BRANCH=$SOURCE_BRANCH" >> "$GITHUB_ENV"
+          echo "Using source: $SOURCE_REPO@$SOURCE_BRANCH (releases upload to source repo)"
+      # ----- Read logging preference from Firebase -----
+      - name: Check logging preference
+        id: logging
+        shell: bash
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          LOGGING=$(curl -sf "${FIREBASE_DATABASE_URL}/settings/workflows/build-win.yml/loggingEnabled.json?auth=${FIREBASE_AUTH}" 2>/dev/null || echo "true")
+          LOGGING=$(echo "$LOGGING" | tr -d '"')
+          if [ "$LOGGING" = "false" ]; then
+            echo "ENABLE_LOGGING=false" >> $GITHUB_ENV
+            echo "📝 Logging: DISABLED"
+          else
+            echo "ENABLE_LOGGING=true" >> $GITHUB_ENV
+            echo "📝 Logging: ENABLED"
+          fi
+
+      # ----- Update pending status (or create if manual dispatch) -----
+      - name: Update build status
+        shell: bash
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          PENDING_ID="${{ github.event.client_payload.pending_id }}"
+          if [ -z "$PENDING_ID" ]; then
+            PENDING_ID="build-windows-pending-${GITHUB_RUN_ID}"
+            curl -s -X PUT "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{\"id\":\"${PENDING_ID}\",\"platform\":\"windows\",\"status\":\"building\",\"createdAt\":$(date +%s000),\"runId\":\"${GITHUB_RUN_ID}\",\"source\":\"workflow\"}" &
+          else
+            curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{\"runId\":\"${GITHUB_RUN_ID}\",\"workflowStarted\":$(date +%s000)}" &
+          fi
+          echo "PENDING_ID=$PENDING_ID" >> $GITHUB_ENV
+
+          # Define firebase_log helper
+          cat > /tmp/firebase_log.sh << 'LOGHELPER'
+          #!/bin/bash
+          if [ "$ENABLE_LOGGING" != "true" ]; then exit 0; fi
+          STEP="$1"; TEXT="$2"
+          if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ] && [ -n "$PENDING_ID" ]; then
+            ESCAPED=$(echo "$TEXT" | jq -Rs .)
+            curl -sf -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{\"step\":\"${STEP}\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+          fi
+          LOGHELPER
+          chmod +x /tmp/firebase_log.sh
+
+          # Define stream_log helper
+          cat > /tmp/stream_log.sh << 'LOGFUNC'
+          #!/bin/bash
+          STEP_NAME="$1"
+          LOG_BUFFER=""
+          LINE_COUNT=0
+          while IFS= read -r line; do
+            echo "$line"
+            if [ "$ENABLE_LOGGING" != "true" ]; then continue; fi
+            LOG_BUFFER="${LOG_BUFFER}${line}\n"
+            LINE_COUNT=$((LINE_COUNT + 1))
+            if [ $LINE_COUNT -ge 10 ] || echo "$line" | grep -qE '^\[|✅|❌|⚠️|Error|error:|warning:'; then
+              if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ] && [ -n "$PENDING_ID" ]; then
+                ESCAPED=$(echo -e "$LOG_BUFFER" | jq -Rs .)
+                curl -sf -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"step\":\"${STEP_NAME}\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+              fi
+              LOG_BUFFER=""
+              LINE_COUNT=0
+            fi
+          done
+          if [ -n "$LOG_BUFFER" ] && [ "$ENABLE_LOGGING" = "true" ] && [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ] && [ -n "$PENDING_ID" ]; then
+            ESCAPED=$(echo -e "$LOG_BUFFER" | jq -Rs .)
+            curl -sf -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{\"step\":\"${STEP_NAME}\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 || true
+          fi
+          LOGFUNC
+          chmod +x /tmp/stream_log.sh
+
+          /tmp/firebase_log.sh "init" "🚀 Windows build started..."
+
+      # ----- Clean up old Windows build releases -----
+      - name: Clean up old Windows build releases
+        shell: bash
+        env:
+          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          /tmp/firebase_log.sh "cleanup" "🗑️ Cleaning up old releases..."
+
+          PUBLIC_REPO="${SOURCE_REPO}"
+
+          echo "🗑️ Cleaning up old Windows build releases from ${PUBLIC_REPO}..."
+          OLD_RELEASES=$(curl -s \
+            -H "Authorization: token $PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/releases?per_page=100")
+
+          echo "$OLD_RELEASES" | jq -r '.[] | select(.tag_name | startswith("windows-build-")) | "\(.id) \(.tag_name)"' | while read RELEASE_ID RELEASE_TAG; do
+            echo "  Deleting release: $RELEASE_TAG"
+            curl -s -X DELETE \
+              -H "Authorization: token $PAT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${PUBLIC_REPO}/releases/${RELEASE_ID}"
+            curl -s -X DELETE \
+              -H "Authorization: token $PAT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${PUBLIC_REPO}/git/refs/tags/${RELEASE_TAG}" 2>/dev/null || true
+
+            if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ]; then
+              BUILD_ID="build-${RELEASE_TAG}"
+              curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${BUILD_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+              echo "    Removed Firebase entry: ${BUILD_ID}"
+            fi
+          done
+
+          # Clean up orphaned and stale entries (non-critical, don't fail build)
+          if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ]; then
+            echo "🔍 Syncing Firebase buildReleases with GitHub..."
+            (
+              EXISTING_TAGS=$(echo "$OLD_RELEASES" | jq -r '.[].tag_name' 2>/dev/null || echo "")
+              FB_RELEASES=$(curl -s "${FIREBASE_DATABASE_URL}/buildReleases.json?auth=${FIREBASE_AUTH}&shallow=true" 2>/dev/null || echo "{}")
+              if [ "$FB_RELEASES" != "null" ] && [ "$FB_RELEASES" != "{}" ] && [ -n "$FB_RELEASES" ]; then
+                echo "$FB_RELEASES" | jq -r 'keys[]' 2>/dev/null | while read FB_ID; do
+                  TAG_FROM_ID="${FB_ID#build-}"
+                  if echo "$TAG_FROM_ID" | grep -q "^windows-build-"; then
+                    if ! echo "$EXISTING_TAGS" | grep -qF "$TAG_FROM_ID"; then
+                      echo "  Removing orphaned Firebase entry: ${FB_ID}"
+                      curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${FB_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+                    fi
+                  fi
+                  if echo "$FB_ID" | grep -q "windows.*pending"; then
+                    ENTRY_DATA=$(curl -s "${FIREBASE_DATABASE_URL}/buildReleases/${FB_ID}.json?auth=${FIREBASE_AUTH}" 2>/dev/null)
+                    CREATED_AT=$(echo "$ENTRY_DATA" | jq -r '.createdAt // 0' 2>/dev/null || echo "0")
+                    NOW_S=$(date +%s)
+                    CREATED_S=$((CREATED_AT / 1000))
+                    AGE_S=$((NOW_S - CREATED_S))
+                    if [ "$AGE_S" -gt 7200 ] 2>/dev/null; then
+                      echo "  Removing stale pending entry: ${FB_ID} (age: $((AGE_S / 60)) minutes)"
+                      curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${FB_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+                      curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildLogs/${FB_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+                    fi
+                  fi
+                done
+              fi
+            ) || echo "⚠️ Cleanup sync had errors (non-critical, continuing)"
+          fi
+          echo "✅ Old releases cleaned up"
+
+      # ----- Clone source project -----
+      - name: Clone source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_BRANCH }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+          fetch-depth: 1
+
+      - name: Log checkout complete
+        shell: bash
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          /tmp/firebase_log.sh "checkout" "✅ Source cloned successfully"
+
+      # ----- Setup Flutter with caching -----
+      - name: Cache Flutter SDK
+        id: cache-flutter
+        uses: actions/cache@v4
+        with:
+          path: ~/flutter
+          key: flutter-stable-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Flutter
+        if: steps.cache-flutter.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          /tmp/firebase_log.sh "flutter" "📥 Installing Flutter SDK..."
+          git clone https://github.com/flutter/flutter.git -b stable --depth 1 $HOME/flutter 2>&1
+          /tmp/firebase_log.sh "flutter" "✅ Flutter SDK installed"
+
+      - name: Add Flutter to PATH
+        shell: bash
+        run: echo "$HOME/flutter/bin" >> $GITHUB_PATH
+
+      - name: Flutter version
+        shell: bash
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          FULL=$(flutter --version 2>&1) || true
+          VERSION=$(echo "$FULL" | head -1)
+          echo "$VERSION"
+          /tmp/firebase_log.sh "flutter" "🔧 $VERSION"
+
+      # ----- Ensure Windows project exists -----
+      - name: Ensure Windows project exists
+        shell: bash
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        working-directory: remote_home
+        run: |
+          if [ ! -d "windows" ]; then
+            echo "Windows directory not found. Creating Windows platform files..."
+            /tmp/firebase_log.sh "windows" "📁 Creating Windows project..."
+            flutter create --platforms=windows . 2>&1
+          else
+            /tmp/firebase_log.sh "windows" "✅ Windows project exists"
+          fi
+
+      # ----- Verify firebase_options.dart -----
+      - name: Verify Firebase config
+        shell: bash
+        working-directory: remote_home
+        run: |
+          if [ ! -f "lib/firebase_options.dart" ]; then
+            echo "❌ firebase_options.dart not found in repo!"
+            exit 1
+          fi
+          echo "✅ firebase_options.dart found"
+
+      # ----- Install Visual Studio Build Tools (already on windows-latest) -----
+      - name: Enable Windows desktop support
+        shell: bash
+        working-directory: remote_home
+        run: |
+          flutter config --enable-windows-desktop
+          flutter doctor -v 2>&1 | head -30
+
+      # ----- Cache and install dependencies -----
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\Pub\Cache
+            .dart_tool
+          key: pub-${{ runner.os }}-${{ hashFiles('remote_home/pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Get Flutter dependencies
+        shell: bash
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        working-directory: remote_home
+        run: |
+          curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d '{"step":"dependencies","stepLabel":"Getting dependencies..."}' &
+
+          flutter pub get 2>&1 | /tmp/stream_log.sh "deps"
+
+      # ----- Generate app icons -----
+      - name: Generate app icons
+        shell: bash
+        working-directory: remote_home
+        run: |
+          if [ -f "windows/runner/resources/app_icon.ico" ]; then
+            echo "✅ App icons already generated, skipping"
+          else
+            echo "🎨 Generating app icons..."
+            dart run flutter_launcher_icons 2>&1 || true
+          fi
+
+      # ----- Build Windows -----
+      - name: Build Flutter Windows
+        shell: bash
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        working-directory: remote_home
+        run: |
+          curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d '{"step":"compiling","stepLabel":"Compiling Windows app..."}' &
+
+          flutter build windows --release --suppress-analytics 2>&1 | /tmp/stream_log.sh "compile"
+          echo "✅ Flutter Windows build completed"
+
+      # ----- Package as ZIP -----
+      - name: Package Windows build
+        shell: bash
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        working-directory: remote_home
+        run: |
+          /tmp/firebase_log.sh "packaging" "📦 Packaging Windows build..."
+
+          BUILD_DIR="build/windows/x64/runner/Release"
+          if [ ! -d "$BUILD_DIR" ]; then
+            # Fallback for older Flutter versions
+            BUILD_DIR="build/windows/runner/Release"
+          fi
+
+          if [ ! -d "$BUILD_DIR" ]; then
+            echo "❌ Windows build output not found"
+            find build/windows -type d 2>/dev/null || true
+            exit 1
+          fi
+
+          ZIP_PATH="build/SpaceNxt-Windows.zip"
+          cd "$BUILD_DIR"
+          # Use PowerShell for zipping on Windows
+          powershell -Command "Compress-Archive -Path * -DestinationPath '$GITHUB_WORKSPACE/remote_home/$ZIP_PATH' -Force"
+          cd "$GITHUB_WORKSPACE"
+
+          echo "✅ Windows ZIP created: $(du -h $ZIP_PATH | cut -f1)"
+          /tmp/firebase_log.sh "packaging" "✅ Windows build packaged"
+
+      # ----- Upload ZIP as a release artifact to PUBLIC repo -----
+      - name: Upload Windows build
+        shell: bash
+        env:
+          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+        working-directory: remote_home
+        run: |
+          PUBLIC_REPO="${SOURCE_REPO}"
+          ZIP_PATH="build/SpaceNxt-Windows.zip"
+          TAG="windows-build-$(date +%Y%m%d-%H%M%S)"
+
+          echo "📦 ZIP size: $(du -h $ZIP_PATH | cut -f1)"
+          echo "📤 Uploading to PUBLIC repo: ${PUBLIC_REPO}"
+
+          RELEASE_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/releases" \
+            -d "{\"tag_name\":\"${TAG}\",\"name\":\"Windows Build ${TAG}\",\"body\":\"Windows build by CI from ${SOURCE_REPO}\",\"draft\":false,\"prerelease\":false}")
+
+          UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | grep -o '"upload_url": "[^"]*' | sed 's/"upload_url": "//' | sed 's/{.*//')
+
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "❌ Failed to create release. Response:"
+            echo "$RELEASE_RESPONSE"
+            exit 1
+          fi
+
+          UPLOAD_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${PAT}" \
+            -H "Content-Type: application/octet-stream" \
+            "${UPLOAD_URL}?name=SpaceNxt-Windows.zip" \
+            --data-binary @"$ZIP_PATH")
+
+          BROWSER_DOWNLOAD_URL=$(echo "$UPLOAD_RESPONSE" | jq -r '.browser_download_url // empty')
+
+          if [ -z "$BROWSER_DOWNLOAD_URL" ]; then
+            echo "⚠️ Upload may have failed. Response:"
+            echo "$UPLOAD_RESPONSE"
+            exit 1
+          else
+            echo "✅ Windows build uploaded: ${BROWSER_DOWNLOAD_URL}"
+          fi
+
+          RELEASE_URL="https://github.com/${PUBLIC_REPO}/releases/tag/${TAG}"
+          echo "✅ Release page: ${RELEASE_URL}"
+
+          echo "BUILD_TAG=${TAG}" >> $GITHUB_ENV
+          echo "RELEASE_URL=${RELEASE_URL}" >> $GITHUB_ENV
+          echo "ZIP_SIZE=$(stat -c%s "$ZIP_PATH" 2>/dev/null || wc -c < "$ZIP_PATH" | tr -d ' ')" >> $GITHUB_ENV
+          echo "ASSET_DOWNLOAD_URL=${BROWSER_DOWNLOAD_URL}" >> $GITHUB_ENV
+
+      # ----- Notify admin users -----
+      - name: Notify admins about new build
+        shell: bash
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+        run: |
+          if [ -z "$FIREBASE_DATABASE_URL" ] || [ -z "$FIREBASE_AUTH" ]; then
+            echo "⚠️ Firebase secrets not set, skipping build notification"
+            exit 0
+          fi
+
+          if [ -n "$PENDING_ID" ]; then
+            curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+            curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+          fi
+
+          if [ -z "$BUILD_TAG" ]; then
+            echo "⚠️ No BUILD_TAG set, skipping notification"
+            exit 0
+          fi
+
+          REPO="${SOURCE_REPO}"
+          TAG="${BUILD_TAG}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          TIMESTAMP_MS=$(date +%s000)
+          BUILD_ID="build-${TAG}"
+
+          COMMIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          COMMIT_MSG=$(git log -1 --pretty=%B 2>/dev/null | head -1 || echo "No commit message")
+
+          echo "📡 Fetching admin users from Firebase..."
+          USERS_JSON=$(curl -s "${FIREBASE_DATABASE_URL}/users.json?auth=${FIREBASE_AUTH}")
+
+          if [ -z "$USERS_JSON" ] || [ "$USERS_JSON" = "null" ]; then
+            echo "⚠️ No users found in Firebase, skipping notification"
+            exit 0
+          fi
+
+          ADMIN_UIDS=$(echo "$USERS_JSON" | jq -r '[to_entries[] | select(.value.role == "admin") | .key] | join(",")')
+
+          if [ -z "$ADMIN_UIDS" ]; then
+            echo "⚠️ No admin users found, skipping notification"
+            exit 0
+          fi
+
+          ADMIN_UIDS_JSON=$(echo "$ADMIN_UIDS" | jq -R 'split(",")' 2>/dev/null || echo "[]")
+          ADMIN_COUNT=$(echo "$ADMIN_UIDS_JSON" | jq 'length')
+          echo "  Found ${ADMIN_COUNT} admin user(s)"
+
+          echo "📝 Writing build release to Firebase..."
+          curl -s -X PUT "${FIREBASE_DATABASE_URL}/buildReleases/${BUILD_ID}.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"id\": \"${BUILD_ID}\",
+              \"platform\": \"windows\",
+              \"version\": \"${TAG}\",
+              \"downloadUrl\": \"${ASSET_DOWNLOAD_URL}\",
+              \"releaseUrl\": \"${RELEASE_URL}\",
+              \"buildNumber\": \"${GITHUB_RUN_NUMBER:-0}\",
+              \"commitSha\": \"${COMMIT_SHA}\",
+              \"commitMessage\": $(echo "$COMMIT_MSG" | jq -Rs .),
+              \"createdAt\": ${TIMESTAMP_MS},
+              \"fileSizeBytes\": ${ZIP_SIZE:-0},
+              \"status\": \"success\",
+              \"notifiedUids\": ${ADMIN_UIDS_JSON}
+            }"
+          echo "  ✅ Build release recorded"
+
+          NOTIFICATION_ID="build-notif-$(date +%s)-$RANDOM"
+          echo "📬 Sending build notification to admins..."
+          NOTIFICATION_JSON=$(jq -n \
+            --arg id "$NOTIFICATION_ID" \
+            --arg title "New Windows Build Available" \
+            --arg message "Build ${TAG} is ready for download" \
+            --arg senderUid "system" \
+            --arg senderName "CI Build System" \
+            --argjson recipientUids "$ADMIN_UIDS_JSON" \
+            --arg createdAt "$TIMESTAMP" \
+            --arg buildReleaseId "$BUILD_ID" \
+            '{
+              id: $id,
+              title: $title,
+              message: $message,
+              senderUid: $senderUid,
+              senderName: $senderName,
+              recipientUids: $recipientUids,
+              sentToAll: false,
+              createdAt: $createdAt,
+              isRead: false,
+              buildReleaseId: $buildReleaseId
+            }')
+          curl -s -X PUT "${FIREBASE_DATABASE_URL}/notifications/${NOTIFICATION_ID}.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d "$NOTIFICATION_JSON"
+          echo "  ✅ Build notification sent to ${ADMIN_COUNT} admin(s)"
+
+      # ----- Commit Windows project files back -----
+      - name: Commit Windows project files to source repo
+        shell: bash
+        working-directory: remote_home
+        run: |
+          BRANCH="${SOURCE_BRANCH}"
+
+          rm -rf build
+          rm -rf .dart_tool
+
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+          git add windows/ 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "ℹ️ No Windows changes to commit"
+          else
+            git commit -m "Update Windows project files [ci-bot]"
+            git push origin HEAD:${BRANCH}
+            echo "✅ Windows changes pushed (branch: ${BRANCH})"
+          fi

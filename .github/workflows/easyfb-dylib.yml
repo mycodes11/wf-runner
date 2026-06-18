@@ -1,17 +1,18 @@
-name: Build EasyFB dylib
+name: Build PiPEnabler dylib
 
 on:
   push:
     branches: [main]
     paths:
-      - "ios_dylibs/src/EasyFB.m"
-      - "ios_dylibs/src/EasyFB.h"
-      - "ios_dylibs/src/fishhook.c"
-      - "ios_dylibs/src/fishhook.h"
-      - "ios_dylibs/EasyFB.plist"
-      - "ios_dylibs/scripts/ci-build-easyfb.sh"
+      - "ios_dylibs/src/PiPEnabler.m"
+      - "ios_dylibs/src/PiPManager.m"
+      - "ios_dylibs/src/PiPManager.h"
+      - "ios_dylibs/src/PiPStreamServer.m"
+      - "ios_dylibs/src/PiPStreamServer.h"
+      - "ios_dylibs/PiPEnabler.plist"
+      - "ios_dylibs/scripts/ci-build-pipenabler.sh"
   repository_dispatch:
-    types: [build-easyfb-dylib]
+    types: [build-pipenabler-dylib]
   workflow_dispatch:
     inputs:
       source_repo:
@@ -26,7 +27,7 @@ on:
         type: string
 
 concurrency:
-  group: dylib-build-easyfb-${{ github.ref }}
+  group: dylib-build-pipenabler-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -80,22 +81,22 @@ jobs:
           echo "Using: $(xcodebuild -version)"
           echo "SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
 
-      - name: Build EasyFB dylib
+      - name: Build PiPEnabler dylib
         working-directory: ${{ env.BUILD_ROOT }}
         run: |
-          chmod +x scripts/ci-build-easyfb.sh scripts/build.sh
-          ./scripts/ci-build-easyfb.sh
-          test -f build/EasyFB.dylib
-          test ! -f build/PiPEnabler.dylib && test ! -f build/PiP.dylib
-          ls -lh build/EasyFB.dylib
+          chmod +x scripts/ci-build-pipenabler.sh scripts/build.sh
+          ./scripts/ci-build-pipenabler.sh
+          test -f build/PiPEnabler.dylib
+          test ! -f build/EasyFB.dylib && test ! -f build/PiP.dylib
+          ls -lh build/PiPEnabler.dylib
 
       - name: Create release in source repository
         env:
           PAT: ${{ secrets.SOURCE_REPO_PAT || github.token }}
         run: |
           PUBLIC_REPO="${SOURCE_REPO}"
-          TAG="easyfb-dylib-$(date +%Y%m%d-%H%M%S)"
-          PREFIX="easyfb-dylib-"
+          TAG="pipenabler-dylib-$(date +%Y%m%d-%H%M%S)"
+          PREFIX="pipenabler-dylib-"
 
           page=1
           while :; do
@@ -129,8 +130,8 @@ jobs:
             "https://api.github.com/repos/${PUBLIC_REPO}/releases" \
             -d "{
               \"tag_name\": \"${TAG}\",
-              \"name\": \"EasyFB.dylib\",
-              \"body\": \"**EasyFB.dylib** - Substrate-free Facebook tweak\",
+              \"name\": \"PiPEnabler.dylib\",
+              \"body\": \"**PiPEnabler.dylib** - PiP for all apps\",
               \"draft\": false,
               \"prerelease\": false
             }")
@@ -145,5 +146,5 @@ jobs:
             -H "Authorization: token $PAT" \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Content-Type: application/octet-stream" \
-            "${UPLOAD_URL}?name=EasyFB.dylib" \
-            --data-binary @"${BUILD_ROOT}/build/EasyFB.dylib"
+            "${UPLOAD_URL}?name=PiPEnabler.dylib" \
+            --data-binary @"${BUILD_ROOT}/build/PiPEnabler.dylib"

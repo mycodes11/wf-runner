@@ -1,8 +1,8 @@
-name: Build Workflow Manager - iOS
+name: Build Admin Panel - iOS
 
 on:
   repository_dispatch:
-    types: [build-workflowmanager-ios]
+    types: [build-adminpanel-ios]
   workflow_dispatch:
     inputs:
       source_repo:
@@ -36,10 +36,10 @@ jobs:
         run: |
           PENDING_ID="${{ github.event.client_payload.pending_id }}"
           if [ -z "$PENDING_ID" ]; then
-            PENDING_ID="build-workflowmanager-ios-pending-${GITHUB_RUN_ID}"
+            PENDING_ID="build-adminpanel-ios-pending-${GITHUB_RUN_ID}"
             curl -s -X PUT "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
               -H "Content-Type: application/json" \
-              -d "{\"id\":\"${PENDING_ID}\",\"platform\":\"ios\",\"app\":\"workflow-manager\",\"status\":\"building\",\"createdAt\":$(date +%s000),\"runId\":\"${GITHUB_RUN_ID}\",\"source\":\"workflow\"}" &
+              -d "{\"id\":\"${PENDING_ID}\",\"platform\":\"ios\",\"app\":\"admin-panel\",\"status\":\"building\",\"createdAt\":$(date +%s000),\"runId\":\"${GITHUB_RUN_ID}\",\"source\":\"workflow\"}" &
           else
             curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
               -H "Content-Type: application/json" \
@@ -50,10 +50,10 @@ jobs:
           # Write initial log entry immediately so logs appear right away
           curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
             -H "Content-Type: application/json" \
-            -d "{\"step\":\"init\",\"text\":\"🚀 Workflow Manager build started...\",\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+            -d "{\"step\":\"init\",\"text\":\"🚀 Admin Panel build started...\",\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
 
-      # ----- Clean up old Workflow Manager iOS build releases -----
-      - name: Clean up old Workflow Manager iOS build releases
+      # ----- Clean up old Admin Panel iOS build releases -----
+      - name: Clean up old Admin Panel iOS build releases
         env:
           PAT: ${{ secrets.SOURCE_REPO_PAT }}
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
@@ -65,13 +65,13 @@ jobs:
 
           PUBLIC_REPO="${SOURCE_REPO}"
 
-          echo "🗑️ Cleaning up old Workflow Manager iOS build releases from ${PUBLIC_REPO}..."
+          echo "🗑️ Cleaning up old Admin Panel iOS build releases from ${PUBLIC_REPO}..."
           OLD_RELEASES=$(curl -s \
             -H "Authorization: token $PAT" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${PUBLIC_REPO}/releases?per_page=100")
 
-          echo "$OLD_RELEASES" | jq -r '.[] | select(.tag_name | startswith("WorkflowManager-ios-build-")) | "\(.id) \(.tag_name)"' | while read RELEASE_ID RELEASE_TAG; do
+          echo "$OLD_RELEASES" | jq -r '.[] | select(.tag_name | startswith("adminpanel-ios-build-")) | "\(.id) \(.tag_name)"' | while read RELEASE_ID RELEASE_TAG; do
             echo "  Deleting release: $RELEASE_TAG"
             curl -s -X DELETE \
               -H "Authorization: token $PAT" \
@@ -97,13 +97,13 @@ jobs:
             if [ "$FB_RELEASES" != "null" ] && [ "$FB_RELEASES" != "{}" ] && [ -n "$FB_RELEASES" ]; then
               echo "$FB_RELEASES" | jq -r 'keys[]' 2>/dev/null | while read FB_ID; do
                 TAG_FROM_ID="${FB_ID#build-}"
-                if echo "$TAG_FROM_ID" | grep -q "^WorkflowManager-ios-build-"; then
+                if echo "$TAG_FROM_ID" | grep -q "^adminpanel-ios-build-"; then
                   if ! echo "$EXISTING_TAGS" | grep -qF "$TAG_FROM_ID"; then
                     echo "  Removing orphaned Firebase entry: ${FB_ID}"
                     curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${FB_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
                   fi
                 fi
-                if echo "$FB_ID" | grep -q "workflowmanager.*ios.*pending"; then
+                if echo "$FB_ID" | grep -q "adminpanel.*ios.*pending"; then
                   ENTRY_DATA=$(curl -s "${FIREBASE_DATABASE_URL}/buildReleases/${FB_ID}.json?auth=${FIREBASE_AUTH}" 2>/dev/null)
                   CREATED_AT=$(echo "$ENTRY_DATA" | jq -r '.createdAt // 0')
                   NOW_MS=$(date +%s000)
@@ -144,7 +144,7 @@ jobs:
         run: echo "$HOME/flutter/bin" >> $GITHUB_PATH
 
       - name: Ensure iOS project exists
-        working-directory: workflow_manager
+        working-directory: admin_panel
         run: |
           if [ ! -d "ios" ]; then
             flutter create --platforms=ios .
@@ -156,16 +156,16 @@ jobs:
         with:
           path: |
             ~/.pub-cache
-            workflow_manager/.dart_tool
-          key: pub-wfm-${{ runner.os }}-${{ hashFiles('workflow_manager/pubspec.lock') }}
+            admin_panel/.dart_tool
+          key: pub-adminpanel-${{ runner.os }}-${{ hashFiles('admin_panel/pubspec.lock') }}
           restore-keys: |
-            pub-wfm-${{ runner.os }}-
+            pub-adminpanel-${{ runner.os }}-
 
       - name: Get Flutter dependencies
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
-        working-directory: workflow_manager
+        working-directory: admin_panel
         run: |
           curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
             -H "Content-Type: application/json" \
@@ -180,7 +180,7 @@ jobs:
 
       # ----- Generate app icons for iOS (skip if already generated) -----
       - name: Generate iOS app icons
-        working-directory: workflow_manager
+        working-directory: admin_panel
         run: |
           if [ -f "ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-1024x1024@1x.png" ]; then
             echo "✅ App icons already generated, skipping"
@@ -192,7 +192,7 @@ jobs:
       # ----- Fix iOS deployment target -----
       - name: Fix iOS deployment target
         run: |
-          cd workflow_manager/ios
+          cd admin_panel/ios
           if grep -q "platform :ios" Podfile; then
             sed -i '' "s/platform :ios, '.*'/platform :ios, '13.0'/" Podfile
           else
@@ -205,18 +205,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            workflow_manager/ios/Pods
+            admin_panel/ios/Pods
             ~/.cocoapods/repos
-          key: pods-wfm-${{ runner.os }}-${{ hashFiles('workflow_manager/ios/Podfile.lock') }}
+          key: pods-adminpanel-${{ runner.os }}-${{ hashFiles('admin_panel/ios/Podfile.lock') }}
           restore-keys: |
-            pods-wfm-${{ runner.os }}-
+            pods-adminpanel-${{ runner.os }}-
 
       - name: Install CocoaPods dependencies
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
         run: |
-          cd workflow_manager/ios
+          cd admin_panel/ios
           curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
             -H "Content-Type: application/json" \
             -d '{"step":"pods","stepLabel":"Installing CocoaPods..."}' &
@@ -244,7 +244,7 @@ jobs:
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
-        working-directory: workflow_manager
+        working-directory: admin_panel
         run: |
           curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
             -H "Content-Type: application/json" \
@@ -260,8 +260,8 @@ jobs:
 
       - name: Create IPA
         run: |
-          APP_PATH="workflow_manager/build/ios/iphoneos/Runner.app"
-          ICON_SRC="workflow_manager/assets/icon/app_icon_code_ios.png"
+          APP_PATH="admin_panel/build/ios/iphoneos/Runner.app"
+          ICON_SRC="admin_panel/assets/icon/app_icon_admin_ios_dark.png"
           
           # ----- Inject loose icon PNGs into .app bundle for ESign/Feather -----
           # Modern Xcode compiles icons into Assets.car (binary), but sideloading
@@ -277,17 +277,17 @@ jobs:
             echo "  ⚠️ Source icon not found at $ICON_SRC"
           fi
           
-          mkdir -p workflow_manager/build/ios/Payload
-          cp -r "$APP_PATH" workflow_manager/build/ios/Payload/
+          mkdir -p admin_panel/build/ios/Payload
+          cp -r "$APP_PATH" admin_panel/build/ios/Payload/
           
           # Copy iTunesArtwork for sideloading tools (ESign/Feather library icon)
           if [ -f "$ICON_SRC" ]; then
-            cp "$ICON_SRC" workflow_manager/build/ios/iTunesArtwork
+            cp "$ICON_SRC" admin_panel/build/ios/iTunesArtwork
             echo "✅ iTunesArtwork added from source dark icon"
           fi
           
-          cd workflow_manager/build/ios
-          zip -r WorkflowManager.ipa Payload iTunesArtwork 2>/dev/null || zip -r WorkflowManager.ipa Payload
+          cd admin_panel/build/ios
+          zip -r AdminPanel.ipa Payload iTunesArtwork 2>/dev/null || zip -r AdminPanel.ipa Payload
 
       - name: Upload iOS build
         env:
@@ -296,14 +296,14 @@ jobs:
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
         run: |
           PUBLIC_REPO="${SOURCE_REPO}"
-          IPA_PATH="workflow_manager/build/ios/WorkflowManager.ipa"
-          TAG="WorkflowManager-ios-build-$(date +%Y%m%d-%H%M%S)"
+          IPA_PATH="admin_panel/build/ios/AdminPanel.ipa"
+          TAG="adminpanel-ios-build-$(date +%Y%m%d-%H%M%S)"
 
           RELEASE_RESPONSE=$(curl -s -X POST \
             -H "Authorization: token ${PAT}" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${PUBLIC_REPO}/releases" \
-            -d "{\"tag_name\":\"${TAG}\",\"name\":\"Workflow Manager iOS ${TAG}\",\"body\":\"Workflow Manager IPA (unsigned) built by CI\",\"draft\":false,\"prerelease\":false}")
+            -d "{\"tag_name\":\"${TAG}\",\"name\":\"Admin Panel iOS ${TAG}\",\"body\":\"Admin Panel IPA (unsigned) built by CI\",\"draft\":false,\"prerelease\":false}")
 
           UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | grep -o '"upload_url": "[^"]*' | sed 's/"upload_url": "//' | sed 's/{.*//')
           
@@ -311,7 +311,7 @@ jobs:
             UPLOAD_RESPONSE=$(curl -s -X POST \
               -H "Authorization: token ${PAT}" \
               -H "Content-Type: application/octet-stream" \
-              "${UPLOAD_URL}?name=WorkflowManager.ipa" \
+              "${UPLOAD_URL}?name=AdminPanel.ipa" \
               --data-binary @"$IPA_PATH")
             DOWNLOAD_URL=$(echo "$UPLOAD_RESPONSE" | jq -r '.browser_download_url // empty')
             echo "✅ IPA uploaded: ${DOWNLOAD_URL}"
@@ -336,7 +336,7 @@ jobs:
             -d "{
               \"id\": \"${BUILD_ID}\",
               \"platform\": \"ios\",
-              \"app\": \"workflow-manager\",
+              \"app\": \"admin-panel\",
               \"version\": \"${TAG}\",
               \"downloadUrl\": \"${DOWNLOAD_URL}\",
               \"releaseUrl\": \"${RELEASE_URL}\",
@@ -368,31 +368,31 @@ jobs:
             exit 0
           fi
 
-          APP_VERSION=$(grep "^version:" "$GITHUB_WORKSPACE/workflow_manager/pubspec.yaml" | sed 's/version: //' | cut -d'+' -f1 || echo "1.0.0")
+          APP_VERSION=$(grep "^version:" "$GITHUB_WORKSPACE/admin_panel/pubspec.yaml" | sed 's/version: //' | cut -d'+' -f1 || echo "1.0.0")
           VERSION_DATE=$(date -u +"%Y-%m-%dT%H:%M:%S+00:00")
           FILE_SIZE=${IPA_SIZE:-0}
           COMMIT_SHA=$(cd "$GITHUB_WORKSPACE" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
           COMMIT_MSG=$(cd "$GITHUB_WORKSPACE" && git log -1 --pretty=%B 2>/dev/null | head -1 || echo "No commit message")
           RELEASE_TIME=$(date -u +"%b %d, %Y at %H:%M UTC")
-          VERSION_DESC=$(printf "Workflow Manager v%s\n\nReleased: %s\n\nChanges:\n- [%s] %s" "$APP_VERSION" "$RELEASE_TIME" "$COMMIT_SHA" "$COMMIT_MSG")
+          VERSION_DESC=$(printf "Admin Panel v%s\n\nReleased: %s\n\nChanges:\n- [%s] %s" "$APP_VERSION" "$RELEASE_TIME" "$COMMIT_SHA" "$COMMIT_MSG")
 
-          echo "📝 Updating esign.json apps[2] (Workflow Manager)..."
+          echo "📝 Updating esign.json apps[1] (Admin Panel)..."
 
-          # Update apps[2] (Workflow Manager entry) with release time and commit info
+          # Update apps[1] (Admin Panel entry) with release time and commit info
           jq --arg version "$APP_VERSION" \
              --arg versionDate "$VERSION_DATE" \
              --arg downloadUrl "$ASSET_DOWNLOAD_URL" \
              --arg versionDesc "$VERSION_DESC" \
              --arg releaseTime "$RELEASE_TIME" \
              --argjson size "$FILE_SIZE" \
-             '.apps[2].version = $version |
-              .apps[2].versionDate = $versionDate |
-              .apps[2].downloadURL = $downloadUrl |
-              .apps[2].versionDescription = $versionDesc |
-              .apps[2].subtitle = ("Workflow Manager · " + $releaseTime) |
-              .apps[2].localizedDescription = ("WorkflowManager v" + $version + " by SpaceNxt\nReleased: " + $releaseTime + "\nAutomate workflows and builds.") |
-              .apps[2].size = $size |
-              .apps[2].versions = [{"version": $version, "date": $versionDate, "localizedDescription": $versionDesc, "downloadURL": $downloadUrl, "size": $size}] + (.apps[2].versions // [])' \
+             '.apps[1].version = $version |
+              .apps[1].versionDate = $versionDate |
+              .apps[1].downloadURL = $downloadUrl |
+              .apps[1].versionDescription = $versionDesc |
+              .apps[1].subtitle = ("Admin Panel · " + $releaseTime) |
+              .apps[1].localizedDescription = ("AdminPanel v" + $version + " by SpaceNxt\nReleased: " + $releaseTime + "\nManage devices and users.") |
+              .apps[1].size = $size |
+              .apps[1].versions = [{"version": $version, "date": $versionDate, "localizedDescription": $versionDesc, "downloadURL": $downloadUrl, "size": $size}] + (.apps[1].versions // [])' \
              "$ESIGN_FILE" > "${ESIGN_FILE}.tmp" && mv "${ESIGN_FILE}.tmp" "$ESIGN_FILE"
 
           cat "$ESIGN_FILE"
@@ -408,7 +408,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "ℹ️ No changes to esign.json"
           else
-            git commit -m "Update esign.json Workflow Manager for build ${BUILD_TAG} [ci-bot]"
+            git commit -m "Update esign.json Admin Panel for build ${BUILD_TAG} [ci-bot]"
             for i in 1 2 3; do
               git pull --rebase origin master && git push && break
               echo "⚠️ Push failed (attempt $i), retrying..."
@@ -416,5 +416,3 @@ jobs:
             done
             echo "✅ esign.json pushed to sourceurl repo"
           fi
-
-

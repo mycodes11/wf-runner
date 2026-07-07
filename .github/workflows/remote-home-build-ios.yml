@@ -203,6 +203,9 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Disable Swift Package Manager
+        run: flutter config --no-enable-swift-package-manager
+
       - name: Flutter version
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
@@ -299,6 +302,7 @@ jobs:
             pub-${{ runner.os }}-
 
       - name: Get Flutter dependencies
+        shell: bash
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
@@ -425,6 +429,7 @@ jobs:
             pods-${{ runner.os }}-
 
       - name: Install CocoaPods dependencies
+        shell: bash
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
@@ -458,6 +463,7 @@ jobs:
 
       # ----- Build unsigned IPA -----
       - name: Build Flutter iOS (no codesign)
+        shell: bash
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
@@ -713,7 +719,10 @@ jobs:
           
           # Clone the public sourceurl repo
           echo "📥 Cloning sourceurl repo..."
-          git clone --depth 1 "https://x-access-token:${PAT}@github.com/supulvinod/sourceurl.git" /tmp/sourceurl
+          if ! git clone --depth 1 "https://x-access-token:${PAT}@github.com/supulvinod/sourceurl.git" /tmp/sourceurl; then
+            echo "⚠️ Unable to access supulvinod/sourceurl with the current SOURCE_REPO_PAT, skipping sourceurl sync"
+            exit 0
+          fi
           cd /tmp/sourceurl
           
           ESIGN_FILE="esign.json"
@@ -772,12 +781,20 @@ jobs:
             echo "ℹ️ No changes to esign.json"
           else
             git commit -m "Update esign.json for build ${BUILD_TAG} [ci-bot]"
+            PUSH_OK=false
             for i in 1 2 3; do
-              git pull --rebase origin master && git push && break
+              if git pull --rebase origin master && git push; then
+                PUSH_OK=true
+                break
+              fi
               echo "⚠️ Push failed (attempt $i), retrying..."
               sleep 2
             done
-            echo "✅ esign.json pushed to sourceurl repo"
+            if [ "$PUSH_OK" = "true" ]; then
+              echo "✅ esign.json pushed to sourceurl repo"
+            else
+              echo "⚠️ Failed to push sourceurl sync after 3 attempts; continuing without failing the build"
+            fi
           fi
           
           cd "$GITHUB_WORKSPACE"

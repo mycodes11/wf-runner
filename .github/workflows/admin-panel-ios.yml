@@ -254,6 +254,11 @@ jobs:
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+          FLUTTER_XCODE_CODE_SIGNING_ALLOWED: NO
+          FLUTTER_XCODE_CODE_SIGNING_REQUIRED: NO
+          FLUTTER_XCODE_CODE_SIGN_IDENTITY: ""
+          # Flutter 3.44+ fails after xcodebuild when DEVELOPMENT_TEAM is unset, even with --no-codesign
+          FLUTTER_XCODE_DEVELOPMENT_TEAM: ""
         working-directory: admin_panel
         run: |
           curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \

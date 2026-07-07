@@ -246,7 +246,7 @@ jobs:
           fi
 
       # ----- Build unsigned IPA -----
-      - name: Build Flutter iOS (no codesign)
+      - name: Build iOS (unsigned)
         shell: bash
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
@@ -256,24 +256,25 @@ jobs:
           curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
             -H "Content-Type: application/json" \
             -d '{"step":"compiling","stepLabel":"Compiling iOS app..."}' &
-          flutter build ipa --release --no-codesign --no-tree-shake-icons --suppress-analytics 2>&1 | while IFS= read -r line; do
+          flutter build ios --release --no-codesign --no-tree-shake-icons --suppress-analytics 2>&1 | while IFS= read -r line; do
             echo "$line"
             ESCAPED=$(echo "$line" | jq -Rs .)
             curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
               -H "Content-Type: application/json" \
               -d "{\"step\":\"compile\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
           done
-          echo "✅ Flutter iOS archive build completed"
+          echo "✅ Flutter iOS build completed"
 
-      - name: Create unsigned IPA from archive
+      - name: Create IPA
         run: |
-          mkdir -p workflow_manager/build/ios/ipa
-          APP_PATH="workflow_manager/build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app"
+          APP_PATH=$(find workflow_manager/build/ios -type d -name Runner.app \
+            \( -path "*/Release-iphoneos/*" -o -path "*/iphoneos/*" -o -path "*/Runner.xcarchive/Products/Applications/*" \) \
+            -print -quit)
           ICON_SRC="workflow_manager/assets/icon/app_icon_code_ios.png"
 
-          if [ ! -d "$APP_PATH" ]; then
-            echo "❌ Runner.app not found in archive!"
-            find workflow_manager/build/ios/archive -name "*.app" -type d 2>/dev/null || true
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ Runner.app not found under workflow_manager/build/ios"
+            find workflow_manager/build/ios -maxdepth 4 -type d | sort | tail -n 50
             exit 1
           fi
           echo "✅ Using app bundle: $APP_PATH"
@@ -292,17 +293,17 @@ jobs:
             echo "  ⚠️ Source icon not found at $ICON_SRC"
           fi
           
-          mkdir -p /tmp/Payload
-          cp -r "$APP_PATH" /tmp/Payload/
+          mkdir -p workflow_manager/build/ios/Payload
+          cp -r "$APP_PATH" workflow_manager/build/ios/Payload/
           
           # Copy iTunesArtwork for sideloading tools (ESign/Feather library icon)
           if [ -f "$ICON_SRC" ]; then
-            cp "$ICON_SRC" /tmp/iTunesArtwork
+            cp "$ICON_SRC" workflow_manager/build/ios/iTunesArtwork
             echo "✅ iTunesArtwork added from source dark icon"
           fi
           
-          cd /tmp && zip -qr "$GITHUB_WORKSPACE/workflow_manager/build/ios/ipa/WorkflowManager.ipa" Payload iTunesArtwork 2>/dev/null || zip -qr "$GITHUB_WORKSPACE/workflow_manager/build/ios/ipa/WorkflowManager.ipa" Payload
-          rm -rf /tmp/Payload /tmp/iTunesArtwork
+          cd workflow_manager/build/ios
+          zip -r WorkflowManager.ipa Payload iTunesArtwork 2>/dev/null || zip -r WorkflowManager.ipa Payload
 
       - name: Upload iOS build
         env:
@@ -311,7 +312,7 @@ jobs:
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
         run: |
           PUBLIC_REPO="${SOURCE_REPO}"
-          IPA_PATH="workflow_manager/build/ios/ipa/WorkflowManager.ipa"
+          IPA_PATH="workflow_manager/build/ios/WorkflowManager.ipa"
           TAG="WorkflowManager-ios-build-$(date +%Y%m%d-%H%M%S)"
 
           RELEASE_RESPONSE=$(curl -s -X POST \

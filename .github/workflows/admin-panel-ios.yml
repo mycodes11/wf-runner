@@ -1,0 +1,441 @@
+name: Build Admin Panel - iOS
+
+on:
+  repository_dispatch:
+    types: [build-adminpanel-ios]
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repo to clone (e.g. username/repo-name)'
+        required: true
+        type: string
+      branch:
+        description: 'Branch to build'
+        required: false
+        default: 'main'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+
+      - name: Resolve source target
+        run: |
+          SOURCE_REPO="${{ github.event.inputs.source_repo || github.event.client_payload.source_repo || 'supulvinod/pro-nxt' }}"
+          SOURCE_BRANCH="${{ github.event.inputs.branch || github.event.client_payload.branch || 'main' }}"
+          echo "SOURCE_REPO=$SOURCE_REPO" >> "$GITHUB_ENV"
+          echo "SOURCE_BRANCH=$SOURCE_BRANCH" >> "$GITHUB_ENV"
+          echo "Using source: $SOURCE_REPO@$SOURCE_BRANCH (releases upload to source repo)"
+      - name: Update build status
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          PENDING_ID="${{ github.event.client_payload.pending_id }}"
+          if [ -z "$PENDING_ID" ]; then
+            PENDING_ID="build-adminpanel-ios-pending-${GITHUB_RUN_ID}"
+            curl -s -X PUT "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{\"id\":\"${PENDING_ID}\",\"platform\":\"ios\",\"app\":\"admin-panel\",\"status\":\"building\",\"createdAt\":$(date +%s000),\"runId\":\"${GITHUB_RUN_ID}\",\"source\":\"workflow\"}" &
+          else
+            curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{\"runId\":\"${GITHUB_RUN_ID}\",\"workflowStarted\":$(date +%s000)}" &
+          fi
+          echo "PENDING_ID=$PENDING_ID" >> $GITHUB_ENV
+          
+          # Write initial log entry immediately so logs appear right away
+          curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d "{\"step\":\"init\",\"text\":\"🚀 Admin Panel build started...\",\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+
+      # ----- Clean up old Admin Panel iOS build releases -----
+      - name: Clean up old Admin Panel iOS build releases
+        env:
+          PAT: ${{ secrets.SOURCE_REPO_PAT || github.token }}
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d "{\"step\":\"cleanup\",\"text\":\"🗑️ Cleaning up old releases...\",\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+
+          PUBLIC_REPO="${SOURCE_REPO}"
+
+          echo "🗑️ Cleaning up old Admin Panel iOS build releases from ${PUBLIC_REPO}..."
+          OLD_RELEASES=$(curl -s \
+            -H "Authorization: token $PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/releases?per_page=100")
+
+          echo "$OLD_RELEASES" | jq -r '.[] | select(.tag_name | startswith("adminpanel-ios-build-")) | "\(.id) \(.tag_name)"' | while read RELEASE_ID RELEASE_TAG; do
+            echo "  Deleting release: $RELEASE_TAG"
+            curl -s -X DELETE \
+              -H "Authorization: token $PAT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${PUBLIC_REPO}/releases/${RELEASE_ID}"
+            curl -s -X DELETE \
+              -H "Authorization: token $PAT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${PUBLIC_REPO}/git/refs/tags/${RELEASE_TAG}" 2>/dev/null || true
+
+            if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ]; then
+              BUILD_ID="build-${RELEASE_TAG}"
+              curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${BUILD_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+              echo "    Removed Firebase entry: ${BUILD_ID}"
+            fi
+          done
+
+          # Clean up orphaned Firebase entries and stale pending entries
+          if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ]; then
+            echo "🔍 Syncing Firebase buildReleases with GitHub..."
+            EXISTING_TAGS=$(echo "$OLD_RELEASES" | jq -r '.[].tag_name' 2>/dev/null || echo "")
+            FB_RELEASES=$(curl -s "${FIREBASE_DATABASE_URL}/buildReleases.json?auth=${FIREBASE_AUTH}&shallow=true" 2>/dev/null || echo "{}")
+            if [ "$FB_RELEASES" != "null" ] && [ "$FB_RELEASES" != "{}" ] && [ -n "$FB_RELEASES" ]; then
+              echo "$FB_RELEASES" | jq -r 'keys[]' 2>/dev/null | while read FB_ID; do
+                TAG_FROM_ID="${FB_ID#build-}"
+                if echo "$TAG_FROM_ID" | grep -q "^adminpanel-ios-build-"; then
+                  if ! echo "$EXISTING_TAGS" | grep -qF "$TAG_FROM_ID"; then
+                    echo "  Removing orphaned Firebase entry: ${FB_ID}"
+                    curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${FB_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+                  fi
+                fi
+                if echo "$FB_ID" | grep -q "adminpanel.*ios.*pending"; then
+                  ENTRY_DATA=$(curl -s "${FIREBASE_DATABASE_URL}/buildReleases/${FB_ID}.json?auth=${FIREBASE_AUTH}" 2>/dev/null)
+                  CREATED_AT=$(echo "$ENTRY_DATA" | jq -r '.createdAt // 0')
+                  NOW_MS=$(date +%s000)
+                  AGE_MS=$((NOW_MS - CREATED_AT))
+                  TWO_HOURS_MS=7200000
+                  if [ "$AGE_MS" -gt "$TWO_HOURS_MS" ]; then
+                    echo "  Removing stale pending entry: ${FB_ID} (age: $((AGE_MS / 60000)) minutes)"
+                    curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${FB_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+                    curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildLogs/${FB_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+                  fi
+                fi
+              done
+            fi
+          fi
+          echo "✅ Old releases cleaned up"
+
+      - name: Clone source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_BRANCH }}
+          token: ${{ secrets.SOURCE_REPO_PAT || github.token }}
+          fetch-depth: 1
+          sparse-checkout: |
+            admin_panel
+          sparse-checkout-cone-mode: true
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Disable Swift Package Manager
+        run: flutter config --no-enable-swift-package-manager
+
+      - name: Ensure iOS project exists
+        working-directory: admin_panel
+        run: |
+          if [ ! -d "ios" ]; then
+            flutter create --platforms=ios .
+          fi
+
+      # ----- Cache and install dependencies -----
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            admin_panel/.dart_tool
+          key: pub-adminpanel-${{ runner.os }}-${{ hashFiles('admin_panel/pubspec.lock') }}
+          restore-keys: |
+            pub-adminpanel-${{ runner.os }}-
+
+      - name: Get Flutter dependencies
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        working-directory: admin_panel
+        run: |
+          curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d '{"step":"dependencies","stepLabel":"Getting dependencies..."}' &
+          flutter pub get 2>&1 | while IFS= read -r line; do
+            echo "$line"
+            ESCAPED=$(echo "$line" | jq -Rs .)
+            curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{\"step\":\"deps\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+          done
+
+      # ----- Generate app icons for iOS (skip if already generated) -----
+      - name: Generate iOS app icons
+        working-directory: admin_panel
+        run: |
+          if [ -f "ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-1024x1024@1x.png" ]; then
+            echo "✅ App icons already generated, skipping"
+          else
+            echo "🎨 Generating app icons..."
+            dart run flutter_launcher_icons 2>&1
+          fi
+
+      # ----- Fix iOS deployment target -----
+      - name: Fix iOS deployment target
+        run: |
+          cd admin_panel/ios
+          if grep -q "platform :ios" Podfile; then
+            sed -i '' "s/platform :ios, '.*'/platform :ios, '13.0'/" Podfile
+          else
+            sed -i '' "1s/^/platform :ios, '13.0'\n/" Podfile
+          fi
+
+      # ----- Cache CocoaPods (Pods + specs repo) -----
+      - name: Cache CocoaPods
+        id: pods-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            admin_panel/ios/Pods
+            ~/.cocoapods/repos
+          key: pods-adminpanel-${{ runner.os }}-${{ hashFiles('admin_panel/ios/Podfile.lock') }}
+          restore-keys: |
+            pods-adminpanel-${{ runner.os }}-
+
+      - name: Install CocoaPods dependencies
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          cd admin_panel/ios
+          curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d '{"step":"pods","stepLabel":"Installing CocoaPods..."}' &
+          # Skip pod install if cache hit and Manifest.lock matches Podfile.lock
+          if [ "${{ steps.pods-cache.outputs.cache-hit }}" == "true" ] && \
+             [ -f "Pods/Manifest.lock" ] && \
+             cmp -s "Podfile.lock" "Pods/Manifest.lock"; then
+            echo "✅ Pods cache valid, skipping install"
+            curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d '{"step":"pods","text":"✅ Pods cache valid, skipping install","ts":'$(date +%s000)'}' > /dev/null 2>&1 &
+          else
+            echo "🔄 Installing pods..."
+            (pod install --no-repo-update 2>&1 || pod install 2>&1) | while IFS= read -r line; do
+              echo "$line"
+              ESCAPED=$(echo "$line" | jq -Rs .)
+              curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+                -H "Content-Type: application/json" \
+                -d "{\"step\":\"pods\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+            done
+          fi
+
+      # ----- Build unsigned IPA -----
+      - name: Build iOS (unsigned)
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        working-directory: admin_panel
+        run: |
+          curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d '{"step":"compiling","stepLabel":"Compiling iOS app..."}' &
+          flutter build ios --release --no-codesign --no-tree-shake-icons --suppress-analytics 2>&1 | while IFS= read -r line; do
+            echo "$line"
+            ESCAPED=$(echo "$line" | jq -Rs .)
+            curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{\"step\":\"compile\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+          done
+          echo "✅ Flutter iOS build completed"
+
+      - name: Create IPA
+        run: |
+          APP_PATH=$(find admin_panel/build/ios -type d -name '*.app' \
+            ! -path '*/SourcePackages/*' \
+            \( -path "*/Release-iphoneos/*" -o -path "*/iphoneos/*" -o -path "*/Runner.xcarchive/Products/Applications/*" \) \
+            -print -quit)
+          ICON_SRC="admin_panel/assets/icon/app_icon_admin_ios_dark.png"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ Runner.app not found under admin_panel/build/ios"
+            find admin_panel/build/ios -maxdepth 4 -type d | sort | tail -n 50
+            exit 1
+          fi
+          echo "✅ Using app bundle: $APP_PATH"
+          
+          # ----- Inject loose icon PNGs into .app bundle for ESign/Feather -----
+          # Modern Xcode compiles icons into Assets.car (binary), but sideloading
+          # tools need loose PNG files matching CFBundleIconFiles entries.
+          if [ -f "$ICON_SRC" ]; then
+            echo "🎨 Injecting icon PNGs into Runner.app for sideloading tools..."
+            sips -z 120 120 "$ICON_SRC" --out "$APP_PATH/AppIcon60x60@2x.png" > /dev/null 2>&1 || true
+            sips -z 180 180 "$ICON_SRC" --out "$APP_PATH/AppIcon60x60@3x.png" > /dev/null 2>&1 || true
+            sips -z 152 152 "$ICON_SRC" --out "$APP_PATH/AppIcon76x76@2x.png" > /dev/null 2>&1 || true
+            sips -z 167 167 "$ICON_SRC" --out "$APP_PATH/AppIcon83.5x83.5@2x.png" > /dev/null 2>&1 || true
+            echo "  ✅ Icon PNGs injected: $(ls -la "$APP_PATH"/AppIcon*.png 2>/dev/null | wc -l) files"
+          else
+            echo "  ⚠️ Source icon not found at $ICON_SRC"
+          fi
+          
+          mkdir -p admin_panel/build/ios/Payload
+          cp -r "$APP_PATH" admin_panel/build/ios/Payload/
+          
+          # Copy iTunesArtwork for sideloading tools (ESign/Feather library icon)
+          if [ -f "$ICON_SRC" ]; then
+            cp "$ICON_SRC" admin_panel/build/ios/iTunesArtwork
+            echo "✅ iTunesArtwork added from source dark icon"
+          fi
+          
+          cd admin_panel/build/ios
+          zip -r AdminPanel.ipa Payload iTunesArtwork 2>/dev/null || zip -r AdminPanel.ipa Payload
+
+      - name: Upload iOS build
+        env:
+          PAT: ${{ secrets.SOURCE_REPO_PAT || github.token }}
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        run: |
+          PUBLIC_REPO="${SOURCE_REPO}"
+          IPA_PATH="admin_panel/build/ios/AdminPanel.ipa"
+          TAG="adminpanel-ios-build-$(date +%Y%m%d-%H%M%S)"
+
+          RELEASE_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/releases" \
+            -d "{\"tag_name\":\"${TAG}\",\"name\":\"Admin Panel iOS ${TAG}\",\"body\":\"Admin Panel IPA (unsigned) built by CI\",\"draft\":false,\"prerelease\":false}")
+
+          UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | grep -o '"upload_url": "[^"]*' | sed 's/"upload_url": "//' | sed 's/{.*//')
+          
+          if [ -n "$UPLOAD_URL" ]; then
+            UPLOAD_RESPONSE=$(curl -s -X POST \
+              -H "Authorization: token ${PAT}" \
+              -H "Content-Type: application/octet-stream" \
+              "${UPLOAD_URL}?name=AdminPanel.ipa" \
+              --data-binary @"$IPA_PATH")
+            DOWNLOAD_URL=$(echo "$UPLOAD_RESPONSE" | jq -r '.browser_download_url // empty')
+            echo "✅ IPA uploaded: ${DOWNLOAD_URL}"
+          fi
+
+          RELEASE_URL="https://github.com/${PUBLIC_REPO}/releases/tag/${TAG}"
+          echo "BUILD_TAG=${TAG}" >> $GITHUB_ENV
+          echo "ASSET_DOWNLOAD_URL=${DOWNLOAD_URL}" >> $GITHUB_ENV
+          echo "RELEASE_URL=${RELEASE_URL}" >> $GITHUB_ENV
+          echo "IPA_SIZE=$(stat -f%z "$IPA_PATH" 2>/dev/null || stat -c%s "$IPA_PATH" 2>/dev/null || echo 0)" >> $GITHUB_ENV
+
+          COMMIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          COMMIT_MSG=$(git log -1 --pretty=%B 2>/dev/null | head -1 || echo "No commit message")
+
+          if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ]; then
+            if [ -n "$PENDING_ID" ]; then
+              curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+            fi
+
+            BUILD_ID="build-${TAG}"
+            curl -s -X PUT "${FIREBASE_DATABASE_URL}/buildReleases/${BUILD_ID}.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"id\": \"${BUILD_ID}\",
+                \"platform\": \"ios\",
+                \"app\": \"admin-panel\",
+                \"version\": \"${TAG}\",
+                \"downloadUrl\": \"${DOWNLOAD_URL}\",
+                \"releaseUrl\": \"${RELEASE_URL}\",
+                \"buildNumber\": \"${GITHUB_RUN_NUMBER:-0}\",
+                \"commitSha\": \"${COMMIT_SHA}\",
+                \"commitMessage\": $(echo "$COMMIT_MSG" | jq -Rs .),
+                \"createdAt\": $(date +%s000),
+                \"fileSizeBytes\": ${IPA_SIZE:-0},
+                \"status\": \"success\"
+              }"
+          else
+            echo "ℹ️ Firebase secrets not set, skipping Firebase build metadata update"
+          fi
+
+      - name: Update ESign source JSON
+        if: success()
+        env:
+          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+        run: |
+          if [ -z "$BUILD_TAG" ] || [ -z "$ASSET_DOWNLOAD_URL" ]; then
+            echo "⚠️ No build tag or download URL, skipping esign.json update"
+            exit 0
+          fi
+
+          if [ -z "$PAT" ]; then
+            echo "ℹ️ SOURCE_REPO_PAT not set, skipping sourceurl sync"
+            exit 0
+          fi
+
+          echo "📥 Cloning sourceurl repo..."
+          git clone --depth 1 "https://x-access-token:${PAT}@github.com/supulvinod/sourceurl.git" /tmp/sourceurl
+          cd /tmp/sourceurl
+
+          ESIGN_FILE="esign.json"
+          if [ ! -f "$ESIGN_FILE" ]; then
+            echo "⚠️ esign.json not found, skipping"
+            exit 0
+          fi
+
+          APP_VERSION=$(grep "^version:" "$GITHUB_WORKSPACE/admin_panel/pubspec.yaml" | sed 's/version: //' | cut -d'+' -f1 || echo "1.0.0")
+          VERSION_DATE=$(date -u +"%Y-%m-%dT%H:%M:%S+00:00")
+          FILE_SIZE=${IPA_SIZE:-0}
+          COMMIT_SHA=$(cd "$GITHUB_WORKSPACE" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          COMMIT_MSG=$(cd "$GITHUB_WORKSPACE" && git log -1 --pretty=%B 2>/dev/null | head -1 || echo "No commit message")
+          RELEASE_TIME=$(date -u +"%b %d, %Y at %H:%M UTC")
+          VERSION_DESC=$(printf "Admin Panel v%s\n\nReleased: %s\n\nChanges:\n- [%s] %s" "$APP_VERSION" "$RELEASE_TIME" "$COMMIT_SHA" "$COMMIT_MSG")
+
+          echo "📝 Updating esign.json apps[1] (Admin Panel)..."
+
+          # Update apps[1] (Admin Panel entry) with release time and commit info
+          jq --arg version "$APP_VERSION" \
+             --arg versionDate "$VERSION_DATE" \
+             --arg downloadUrl "$ASSET_DOWNLOAD_URL" \
+             --arg versionDesc "$VERSION_DESC" \
+             --arg releaseTime "$RELEASE_TIME" \
+             --argjson size "$FILE_SIZE" \
+             '.apps[1].version = $version |
+              .apps[1].versionDate = $versionDate |
+              .apps[1].downloadURL = $downloadUrl |
+              .apps[1].versionDescription = $versionDesc |
+              .apps[1].subtitle = ("Admin Panel · " + $releaseTime) |
+              .apps[1].localizedDescription = ("AdminPanel v" + $version + " by SpaceNxt\nReleased: " + $releaseTime + "\nManage devices and users.") |
+              .apps[1].size = $size |
+              .apps[1].versions = [{"version": $version, "date": $versionDate, "localizedDescription": $versionDesc, "downloadURL": $downloadUrl, "size": $size}] + (.apps[1].versions // [])' \
+             "$ESIGN_FILE" > "${ESIGN_FILE}.tmp" && mv "${ESIGN_FILE}.tmp" "$ESIGN_FILE"
+
+          cat "$ESIGN_FILE"
+
+          # Copy app icons to sourceurl repo (using dark background icons)
+          cp "$GITHUB_WORKSPACE/remote_home/assets/icon/app_icon_ios.png" icon_rm.png 2>/dev/null || cp "$GITHUB_WORKSPACE/remote_home/assets/icon/app_icon.png" icon_rm.png 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/admin_panel/assets/icon/app_icon_admin_ios_dark.png" icon_admin.png 2>/dev/null || cp "$GITHUB_WORKSPACE/admin_panel/assets/icon/app_icon_admin.png" icon_admin.png 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/workflow_manager/assets/icon/app_icon_code_ios.png" icon_wfm.png 2>/dev/null || cp "$GITHUB_WORKSPACE/workflow_manager/assets/icon/app_icon_code.png" icon_wfm.png 2>/dev/null || true
+
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add esign.json icon_rm.png icon_admin.png icon_wfm.png
+          if git diff --cached --quiet; then
+            echo "ℹ️ No changes to esign.json"
+          else
+            git commit -m "Update esign.json Admin Panel for build ${BUILD_TAG} [ci-bot]"
+            for i in 1 2 3; do
+              git pull --rebase origin master && git push && break
+              echo "⚠️ Push failed (attempt $i), retrying..."
+              sleep 2
+            done
+            echo "✅ esign.json pushed to sourceurl repo"
+          fi

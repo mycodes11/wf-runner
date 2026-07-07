@@ -296,7 +296,7 @@ jobs:
         with:
           path: |
             ~/.pub-cache
-            .dart_tool
+            remote_home/.dart_tool
           key: pub-${{ runner.os }}-${{ hashFiles('remote_home/pubspec.lock') }}
           restore-keys: |
             pub-${{ runner.os }}-
@@ -422,7 +422,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ios/Pods
+            remote_home/ios/Pods
             ~/.cocoapods/repos
           key: pods-${{ runner.os }}-${{ hashFiles('remote_home/ios/Podfile.lock') }}
           restore-keys: |
@@ -452,7 +452,7 @@ jobs:
           else
             echo "🔄 Installing pods..."
             # Stream ALL pod install output
-            (pod install --no-repo-update 2>&1 || pod install 2>&1) | while IFS= read -r line; do
+            (pod install --deployment --no-repo-update 2>&1 || pod install --no-repo-update 2>&1 || pod install 2>&1) | while IFS= read -r line; do
               echo "$line"
               ESCAPED=$(echo "$line" | jq -Rs .)
               curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \

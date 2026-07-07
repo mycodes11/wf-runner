@@ -262,8 +262,6 @@ jobs:
         working-directory: remote_home
         run: |
           flutter config --enable-windows-desktop
-          flutter doctor -v > /tmp/flutter_doctor.txt 2>&1 || true
-          sed -n '1,30p' /tmp/flutter_doctor.txt
 
       # ----- Cache and install dependencies -----
       - name: Cache pub packages
@@ -271,7 +269,7 @@ jobs:
         with:
           path: |
             ~\AppData\Local\Pub\Cache
-            .dart_tool
+            remote_home/.dart_tool
           key: pub-${{ runner.os }}-${{ hashFiles('remote_home/pubspec.lock') }}
           restore-keys: |
             pub-${{ runner.os }}-

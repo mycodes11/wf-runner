@@ -271,7 +271,7 @@ jobs:
         with:
           path: |
             ~/.pub-cache
-            .dart_tool
+            remote_home/.dart_tool
           key: pub-${{ runner.os }}-${{ hashFiles('remote_home/pubspec.lock') }}
           restore-keys: |
             pub-${{ runner.os }}-
@@ -294,7 +294,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            macos/Pods
+            remote_home/macos/Pods
             ~/.cocoapods/repos
           key: pods-macos-${{ runner.os }}-${{ hashFiles('remote_home/macos/Podfile.lock') }}
           restore-keys: |
@@ -318,7 +318,7 @@ jobs:
             /tmp/firebase_log.sh "pods" "✅ Pods cache valid, skipping install"
           else
             echo "🔄 Installing pods..."
-            (pod install --no-repo-update 2>&1 || pod install 2>&1) | /tmp/stream_log.sh "pods"
+            (pod install --deployment --no-repo-update 2>&1 || pod install --no-repo-update 2>&1 || pod install 2>&1) | /tmp/stream_log.sh "pods"
           fi
           cd ..
 

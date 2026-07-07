@@ -157,7 +157,9 @@ jobs:
       - name: Cache pub packages
         uses: actions/cache@v4
         with:
-          path: ~\AppData\Local\Pub\Cache
+          path: |
+            ~\AppData\Local\Pub\Cache
+            admin_panel/.dart_tool
           key: pub-adminpanel-windows-${{ hashFiles('admin_panel/pubspec.lock') }}
           restore-keys: |
             pub-adminpanel-windows-
@@ -168,7 +170,7 @@ jobs:
 
       - name: Build Windows executable
         working-directory: admin_panel
-        run: flutter build windows --release
+        run: flutter build windows --release --suppress-analytics
 
       - name: Create ZIP archive
         shell: bash

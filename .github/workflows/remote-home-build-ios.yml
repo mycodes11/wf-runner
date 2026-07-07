@@ -202,7 +202,7 @@ jobs:
         with:
           channel: stable
           cache: true
-          cache-key: flutter-remotehome-ios-:os:-stable-:arch:
+          cache-key: flutter-remotehome-ios-${{ runner.os }}-stable
 
       - name: Disable Swift Package Manager
         run: flutter config --no-enable-swift-package-manager

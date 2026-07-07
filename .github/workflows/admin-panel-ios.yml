@@ -236,7 +236,7 @@ jobs:
               -d '{"step":"pods","text":"✅ Pods cache valid, skipping install","ts":'$(date +%s000)'}' > /dev/null 2>&1 &
           else
             echo "🔄 Installing pods..."
-            (pod install --no-repo-update 2>&1 || pod install 2>&1) | while IFS= read -r line; do
+            (pod install --deployment --no-repo-update 2>&1 || pod install --no-repo-update 2>&1 || pod install 2>&1) | while IFS= read -r line; do
               echo "$line"
               ESCAPED=$(echo "$line" | jq -Rs .)
               curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \

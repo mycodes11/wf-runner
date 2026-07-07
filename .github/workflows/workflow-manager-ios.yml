@@ -143,6 +143,7 @@ jobs:
         with:
           channel: stable
           cache: true
+          cache-key: flutter-wfm-ios-:os:-stable-:arch:
 
       - name: Disable Swift Package Manager
         run: flutter config --no-enable-swift-package-manager
@@ -211,8 +212,10 @@ jobs:
         with:
           path: |
             workflow_manager/ios/Pods
+            workflow_manager/ios/Podfile.lock
             ~/.cocoapods/repos
-          key: pods-wfm-${{ runner.os }}-${{ hashFiles('workflow_manager/ios/Podfile.lock') }}
+            ~/Library/Caches/CocoaPods
+          key: pods-wfm-${{ runner.os }}-${{ hashFiles('workflow_manager/ios/Podfile', 'workflow_manager/pubspec.lock') }}
           restore-keys: |
             pods-wfm-${{ runner.os }}-
 

@@ -15,6 +15,13 @@ on:
         default: 'main'
         type: string
 
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
 jobs:
   build-android:
     runs-on: ubuntu-latest
@@ -50,7 +57,7 @@ jobs:
       # ----- Clean up old Admin Panel Android build releases -----
       - name: Clean up old Admin Panel Android build releases
         env:
-          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          PAT: ${{ secrets.SOURCE_REPO_PAT || github.token }}
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
         run: |
@@ -120,8 +127,11 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.SOURCE_BRANCH }}
-          token: ${{ secrets.SOURCE_REPO_PAT }}
+          token: ${{ secrets.SOURCE_REPO_PAT || github.token }}
           fetch-depth: 1
+          sparse-checkout: |
+            admin_panel
+          sparse-checkout-cone-mode: true
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -129,20 +139,11 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Cache Flutter SDK
-        id: cache-flutter
-        uses: actions/cache@v4
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
         with:
-          path: ~/flutter
-          key: flutter-stable-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Install Flutter
-        if: steps.cache-flutter.outputs.cache-hit != 'true'
-        run: |
-          git clone https://github.com/flutter/flutter.git -b stable --depth 1 $HOME/flutter
-
-      - name: Add Flutter to PATH
-        run: echo "$HOME/flutter/bin" >> $GITHUB_PATH
+          channel: stable
+          cache: true
 
       - name: Ensure Android project exists
         working-directory: admin_panel
@@ -185,6 +186,8 @@ jobs:
             ~/.gradle/caches
             ~/.gradle/wrapper
           key: gradle-adminpanel-${{ runner.os }}-${{ hashFiles('admin_panel/android/build.gradle*') }}
+          restore-keys: |
+            gradle-adminpanel-${{ runner.os }}-
 
       - name: Build Flutter APK
         working-directory: admin_panel
@@ -192,7 +195,7 @@ jobs:
 
       - name: Upload APK
         env:
-          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          PAT: ${{ secrets.SOURCE_REPO_PAT || github.token }}
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
         run: |
@@ -233,24 +236,28 @@ jobs:
           COMMIT_MSG=$(git log -1 --pretty=%B 2>/dev/null | head -1 || echo "No commit message")
 
           # Remove pending and add success entry
-          if [ -n "$PENDING_ID" ]; then
-            curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" &
+          if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ]; then
+            if [ -n "$PENDING_ID" ]; then
+              curl -s -X DELETE "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" > /dev/null 2>&1 || true
+            fi
+            
+            BUILD_ID="build-${TAG}"
+            curl -s -X PUT "${FIREBASE_DATABASE_URL}/buildReleases/${BUILD_ID}.json?auth=${FIREBASE_AUTH}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"id\": \"${BUILD_ID}\",
+                \"platform\": \"android\",
+                \"app\": \"admin-panel\",
+                \"version\": \"${TAG}\",
+                \"downloadUrl\": \"${DOWNLOAD_URL}\",
+                \"releaseUrl\": \"${RELEASE_URL}\",
+                \"buildNumber\": \"${GITHUB_RUN_NUMBER:-0}\",
+                \"commitSha\": \"${COMMIT_SHA}\",
+                \"commitMessage\": $(echo "$COMMIT_MSG" | jq -Rs .),
+                \"createdAt\": $(date +%s000),
+                \"fileSizeBytes\": ${APK_SIZE:-0},
+                \"status\": \"success\"
+              }"
+          else
+            echo "ℹ️ Firebase secrets not set, skipping Firebase build metadata update"
           fi
-          
-          BUILD_ID="build-${TAG}"
-          curl -s -X PUT "${FIREBASE_DATABASE_URL}/buildReleases/${BUILD_ID}.json?auth=${FIREBASE_AUTH}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"id\": \"${BUILD_ID}\",
-              \"platform\": \"android\",
-              \"app\": \"admin-panel\",
-              \"version\": \"${TAG}\",
-              \"downloadUrl\": \"${DOWNLOAD_URL}\",
-              \"releaseUrl\": \"${RELEASE_URL}\",
-              \"buildNumber\": \"${GITHUB_RUN_NUMBER:-0}\",
-              \"commitSha\": \"${COMMIT_SHA}\",
-              \"commitMessage\": $(echo "$COMMIT_MSG" | jq -Rs .),
-              \"createdAt\": $(date +%s000),
-              \"fileSizeBytes\": ${APK_SIZE:-0},
-              \"status\": \"success\"
-            }"

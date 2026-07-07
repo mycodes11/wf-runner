@@ -1,4 +1,4 @@
-name: Build Windows
+name: Build Remote Home - Windows
 
 on:
   repository_dispatch:
@@ -14,6 +14,13 @@ on:
         required: false
         default: 'main'
         type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
 
 jobs:
   build-windows:
@@ -119,7 +126,7 @@ jobs:
       - name: Clean up old Windows build releases
         shell: bash
         env:
-          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          PAT: ${{ secrets.SOURCE_REPO_PAT || github.token }}
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
         run: |
@@ -190,8 +197,11 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.SOURCE_BRANCH }}
-          token: ${{ secrets.SOURCE_REPO_PAT }}
+          token: ${{ secrets.SOURCE_REPO_PAT || github.token }}
           fetch-depth: 1
+          sparse-checkout: |
+            remote_home
+          sparse-checkout-cone-mode: true
 
       - name: Log checkout complete
         shell: bash
@@ -202,27 +212,11 @@ jobs:
           /tmp/firebase_log.sh "checkout" "✅ Source cloned successfully"
 
       # ----- Setup Flutter with caching -----
-      - name: Cache Flutter SDK
-        id: cache-flutter
-        uses: actions/cache@v4
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
         with:
-          path: ~/flutter
-          key: flutter-stable-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Install Flutter
-        if: steps.cache-flutter.outputs.cache-hit != 'true'
-        shell: bash
-        env:
-          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
-          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
-        run: |
-          /tmp/firebase_log.sh "flutter" "📥 Installing Flutter SDK..."
-          git clone https://github.com/flutter/flutter.git -b stable --depth 1 $HOME/flutter 2>&1
-          /tmp/firebase_log.sh "flutter" "✅ Flutter SDK installed"
-
-      - name: Add Flutter to PATH
-        shell: bash
-        run: echo "$HOME/flutter/bin" >> $GITHUB_PATH
+          channel: stable
+          cache: true
 
       - name: Flutter version
         shell: bash
@@ -268,7 +262,8 @@ jobs:
         working-directory: remote_home
         run: |
           flutter config --enable-windows-desktop
-          flutter doctor -v 2>&1 | head -30
+          flutter doctor -v > /tmp/flutter_doctor.txt 2>&1 || true
+          sed -n '1,30p' /tmp/flutter_doctor.txt
 
       # ----- Cache and install dependencies -----
       - name: Cache pub packages
@@ -356,7 +351,7 @@ jobs:
       - name: Upload Windows build
         shell: bash
         env:
-          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          PAT: ${{ secrets.SOURCE_REPO_PAT || github.token }}
         working-directory: remote_home
         run: |
           PUBLIC_REPO="${SOURCE_REPO}"
@@ -410,7 +405,7 @@ jobs:
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
-          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          PAT: ${{ secrets.SOURCE_REPO_PAT || github.token }}
         run: |
           if [ -z "$FIREBASE_DATABASE_URL" ] || [ -z "$FIREBASE_AUTH" ]; then
             echo "⚠️ Firebase secrets not set, skipping build notification"

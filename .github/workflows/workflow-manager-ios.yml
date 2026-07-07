@@ -144,6 +144,9 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Disable Swift Package Manager
+        run: flutter config --no-enable-swift-package-manager
+
       - name: Ensure iOS project exists
         working-directory: workflow_manager
         run: |
@@ -163,6 +166,7 @@ jobs:
             pub-wfm-${{ runner.os }}-
 
       - name: Get Flutter dependencies
+        shell: bash
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
@@ -213,6 +217,7 @@ jobs:
             pods-wfm-${{ runner.os }}-
 
       - name: Install CocoaPods dependencies
+        shell: bash
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
@@ -242,6 +247,7 @@ jobs:
 
       # ----- Build unsigned IPA -----
       - name: Build iOS (unsigned)
+        shell: bash
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}

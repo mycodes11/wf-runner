@@ -149,21 +149,45 @@ jobs:
             flutter create --platforms=macos .
           fi
 
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            admin_panel/.dart_tool
+          key: pub-adminpanel-${{ runner.os }}-${{ hashFiles('admin_panel/pubspec.lock') }}
+          restore-keys: |
+            pub-adminpanel-${{ runner.os }}-
+
       - name: Get Flutter dependencies
         working-directory: admin_panel
         run: flutter pub get
 
-      - name: Precache Flutter macOS artifacts
-        run: flutter precache --macos
+      - name: Cache CocoaPods
+        id: pods-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            admin_panel/macos/Pods
+            ~/.cocoapods/repos
+          key: pods-adminpanel-macos-${{ runner.os }}-${{ hashFiles('admin_panel/macos/Podfile.lock') }}
+          restore-keys: |
+            pods-adminpanel-macos-${{ runner.os }}-
 
       - name: Install CocoaPods dependencies
         working-directory: admin_panel/macos
         run: |
-          pod install --repo-update || pod install
+          if [ "${{ steps.pods-cache.outputs.cache-hit }}" == "true" ] && \
+             [ -f "Pods/Manifest.lock" ] && \
+             cmp -s "Podfile.lock" "Pods/Manifest.lock"; then
+            echo "✅ Pods cache valid, skipping install"
+          else
+            pod install --deployment --no-repo-update || pod install --no-repo-update || pod install
+          fi
 
       - name: Build macOS app
         working-directory: admin_panel
-        run: flutter build macos --release
+        run: flutter build macos --release --suppress-analytics
 
       - name: Create ZIP archive
         run: |

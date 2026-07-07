@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Remote Home - Android
 
 on:
   repository_dispatch:
@@ -14,6 +14,13 @@ on:
         required: false
         default: 'main'
         type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
 
 jobs:
   build-android:
@@ -115,7 +122,7 @@ jobs:
       # ----- Clean up old Android build releases -----
       - name: Clean up old Android build releases
         env:
-          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          PAT: ${{ secrets.SOURCE_REPO_PAT || github.token }}
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
         run: |
@@ -184,8 +191,11 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.SOURCE_BRANCH }}
-          token: ${{ secrets.SOURCE_REPO_PAT }}
+          token: ${{ secrets.SOURCE_REPO_PAT || github.token }}
           fetch-depth: 1
+          sparse-checkout: |
+            remote_home
+          sparse-checkout-cone-mode: true
 
       - name: Log checkout complete
         env:
@@ -202,25 +212,11 @@ jobs:
           java-version: '17'
 
       # ----- Setup Flutter with caching -----
-      - name: Cache Flutter SDK
-        id: cache-flutter
-        uses: actions/cache@v4
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
         with:
-          path: ~/flutter
-          key: flutter-stable-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Install Flutter
-        if: steps.cache-flutter.outputs.cache-hit != 'true'
-        env:
-          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
-          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
-        run: |
-          /tmp/firebase_log.sh "flutter" "📥 Installing Flutter SDK..."
-          git clone https://github.com/flutter/flutter.git -b stable --depth 1 $HOME/flutter 2>&1
-          /tmp/firebase_log.sh "flutter" "✅ Flutter SDK installed"
-
-      - name: Add Flutter to PATH
-        run: echo "$HOME/flutter/bin" >> $GITHUB_PATH
+          channel: stable
+          cache: true
 
       - name: Flutter version
         env:
@@ -284,7 +280,7 @@ jobs:
         with:
           path: |
             ~/.pub-cache
-            .dart_tool
+            remote_home/.dart_tool
           key: pub-${{ runner.os }}-${{ hashFiles('remote_home/pubspec.lock') }}
           restore-keys: |
             pub-${{ runner.os }}-
@@ -340,7 +336,7 @@ jobs:
       # ----- Upload APK as a release artifact to PUBLIC repo -----
       - name: Upload APK
         env:
-          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          PAT: ${{ secrets.SOURCE_REPO_PAT || github.token }}
         working-directory: remote_home
         run: |
           PUBLIC_REPO="${SOURCE_REPO}"
@@ -399,7 +395,7 @@ jobs:
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
-          PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          PAT: ${{ secrets.SOURCE_REPO_PAT || github.token }}
         run: |
           if [ -z "$FIREBASE_DATABASE_URL" ] || [ -z "$FIREBASE_AUTH" ]; then
             echo "⚠️ Firebase secrets not set, skipping build notification"

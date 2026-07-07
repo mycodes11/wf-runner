@@ -202,6 +202,7 @@ jobs:
         with:
           channel: stable
           cache: true
+          cache-key: flutter-remotehome-ios-:os:-stable-:arch:
 
       - name: Disable Swift Package Manager
         run: flutter config --no-enable-swift-package-manager
@@ -423,8 +424,10 @@ jobs:
         with:
           path: |
             remote_home/ios/Pods
+            remote_home/ios/Podfile.lock
             ~/.cocoapods/repos
-          key: pods-${{ runner.os }}-${{ hashFiles('remote_home/ios/Podfile.lock') }}
+            ~/Library/Caches/CocoaPods
+          key: pods-${{ runner.os }}-${{ hashFiles('remote_home/ios/Podfile', 'remote_home/pubspec.lock') }}
           restore-keys: |
             pods-${{ runner.os }}-
 

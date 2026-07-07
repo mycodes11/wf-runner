@@ -157,7 +157,9 @@ jobs:
       - name: Cache pub packages
         uses: actions/cache@v4
         with:
-          path: ~\AppData\Local\Pub\Cache
+          path: |
+            ~\AppData\Local\Pub\Cache
+            workflow_manager/.dart_tool
           key: pub-wfm-windows-${{ hashFiles('workflow_manager/pubspec.lock') }}
           restore-keys: |
             pub-wfm-windows-
@@ -168,7 +170,7 @@ jobs:
 
       - name: Build Windows executable
         working-directory: workflow_manager
-        run: flutter build windows --release
+        run: flutter build windows --release --suppress-analytics
 
       - name: Create ZIP archive
         shell: bash

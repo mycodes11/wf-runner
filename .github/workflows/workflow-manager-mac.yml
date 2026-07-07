@@ -149,21 +149,45 @@ jobs:
             flutter create --platforms=macos .
           fi
 
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            workflow_manager/.dart_tool
+          key: pub-workflowmanager-${{ runner.os }}-${{ hashFiles('workflow_manager/pubspec.lock') }}
+          restore-keys: |
+            pub-workflowmanager-${{ runner.os }}-
+
       - name: Get Flutter dependencies
         working-directory: workflow_manager
         run: flutter pub get
 
-      - name: Precache Flutter macOS artifacts
-        run: flutter precache --macos
+      - name: Cache CocoaPods
+        id: pods-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            workflow_manager/macos/Pods
+            ~/.cocoapods/repos
+          key: pods-workflowmanager-macos-${{ runner.os }}-${{ hashFiles('workflow_manager/macos/Podfile.lock') }}
+          restore-keys: |
+            pods-workflowmanager-macos-${{ runner.os }}-
 
       - name: Install CocoaPods dependencies
         working-directory: workflow_manager/macos
         run: |
-          pod install --repo-update || pod install
+          if [ "${{ steps.pods-cache.outputs.cache-hit }}" == "true" ] && \
+             [ -f "Pods/Manifest.lock" ] && \
+             cmp -s "Podfile.lock" "Pods/Manifest.lock"; then
+            echo "✅ Pods cache valid, skipping install"
+          else
+            pod install --deployment --no-repo-update || pod install --no-repo-update || pod install
+          fi
 
       - name: Build macOS app
         working-directory: workflow_manager
-        run: flutter build macos --release
+        run: flutter build macos --release --suppress-analytics
 
       - name: Create ZIP archive
         run: |

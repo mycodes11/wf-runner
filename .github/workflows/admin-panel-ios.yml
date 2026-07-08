@@ -163,7 +163,7 @@ jobs:
           path: |
             ~/.pub-cache
             admin_panel/.dart_tool
-          key: pub-adminpanel-${{ runner.os }}-${{ hashFiles('admin_panel/pubspec.lock') }}
+          key: pub-adminpanel-${{ runner.os }}-${{ hashFiles('admin_panel/pubspec.lock', 'shop/flutter-shop/pubspec.lock') }}
           restore-keys: |
             pub-adminpanel-${{ runner.os }}-
 
@@ -216,9 +216,10 @@ jobs:
             admin_panel/ios/Podfile.lock
             ~/.cocoapods/repos
             ~/Library/Caches/CocoaPods
-          key: pods-adminpanel-${{ runner.os }}-${{ hashFiles('admin_panel/ios/Podfile', 'admin_panel/pubspec.lock') }}
+          # v2: include shop/flutter-shop lock (google_sign_in pods) and bust stale GTMSessionFetcher locks
+          key: pods-adminpanel-v2-${{ runner.os }}-${{ hashFiles('admin_panel/ios/Podfile', 'admin_panel/pubspec.lock', 'shop/flutter-shop/pubspec.lock') }}
           restore-keys: |
-            pods-adminpanel-${{ runner.os }}-
+            pods-adminpanel-v2-${{ runner.os }}-
 
       - name: Install CocoaPods dependencies
         shell: bash
@@ -230,23 +231,51 @@ jobs:
           curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
             -H "Content-Type: application/json" \
             -d '{"step":"pods","stepLabel":"Installing CocoaPods..."}' &
-          # Skip pod install if cache hit and Manifest.lock matches Podfile.lock
-          if [ "${{ steps.pods-cache.outputs.cache-hit }}" == "true" ] && \
-             [ -f "Pods/Manifest.lock" ] && \
-             cmp -s "Podfile.lock" "Pods/Manifest.lock"; then
-            echo "✅ Pods cache valid, skipping install"
-            curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
-              -H "Content-Type: application/json" \
-              -d '{"step":"pods","text":"✅ Pods cache valid, skipping install","ts":'$(date +%s000)'}' > /dev/null 2>&1 &
-          else
-            echo "🔄 Installing pods..."
-            (pod install --deployment --no-repo-update 2>&1 || pod install --no-repo-update 2>&1 || pod install 2>&1) | while IFS= read -r line; do
-              echo "$line"
-              ESCAPED=$(echo "$line" | jq -Rs .)
+
+          log_pod_line() {
+            echo "$1"
+            if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ]; then
+              ESCAPED=$(echo "$1" | jq -Rs .)
               curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
                 -H "Content-Type: application/json" \
                 -d "{\"step\":\"pods\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+            fi
+          }
+
+          run_pod_install() {
+            pod install --repo-update 2>&1 || pod install 2>&1
+          }
+
+          # Skip pod install only when cache restored a consistent Pods tree.
+          if [ "${{ steps.pods-cache.outputs.cache-hit }}" == "true" ] && \
+             [ -f "Pods/Manifest.lock" ] && \
+             [ -f "Podfile.lock" ] && \
+             cmp -s "Podfile.lock" "Pods/Manifest.lock"; then
+            echo "✅ Pods cache valid, skipping install"
+            log_pod_line "✅ Pods cache valid, skipping install"
+          else
+            echo "🔄 Installing pods..."
+            log_pod_line "🔄 Installing pods..."
+            POD_LOG=$(mktemp)
+            run_pod_install 2>&1 | tee "$POD_LOG" | while IFS= read -r line; do
+              log_pod_line "$line"
             done
+            POD_EXIT=${PIPESTATUS[0]}
+
+            if [ "$POD_EXIT" -ne 0 ] && grep -q "could not find compatible versions" "$POD_LOG"; then
+              echo "⚠️ Stale Podfile.lock (often GTMSessionFetcher vs google_sign_in) — regenerating..."
+              log_pod_line "⚠️ Stale Podfile.lock — regenerating CocoaPods resolution"
+              rm -f Podfile.lock
+              rm -rf Pods
+              run_pod_install 2>&1 | tee "$POD_LOG" | while IFS= read -r line; do
+                log_pod_line "$line"
+              done
+              POD_EXIT=${PIPESTATUS[0]}
+            fi
+            rm -f "$POD_LOG"
+            if [ "$POD_EXIT" -ne 0 ]; then
+              exit 1
+            fi
           fi
 
       # ----- Build unsigned IPA -----

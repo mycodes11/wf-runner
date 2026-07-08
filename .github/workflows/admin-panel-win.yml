@@ -136,6 +136,7 @@ jobs:
           fetch-depth: 1
           sparse-checkout: |
             admin_panel
+            shop/flutter-shop
           sparse-checkout-cone-mode: true
 
       - name: Setup Flutter

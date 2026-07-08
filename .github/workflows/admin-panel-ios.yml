@@ -137,6 +137,7 @@ jobs:
           sparse-checkout: |
             admin_panel
             shop/flutter-shop
+            packages/spacenxt_ops_ui
           sparse-checkout-cone-mode: true
 
       - name: Setup Flutter

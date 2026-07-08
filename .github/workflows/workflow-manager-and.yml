@@ -131,6 +131,7 @@ jobs:
           fetch-depth: 1
           sparse-checkout: |
             workflow_manager
+            packages/spacenxt_ops_ui
           sparse-checkout-cone-mode: true
 
       - name: Setup Java

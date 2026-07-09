@@ -1,0 +1,72 @@
+name: Deploy Shop Flutter Web
+
+on:
+  repository_dispatch:
+    types: [deploy-shop-flutter-web]
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repo to clone (e.g. username/repo-name)'
+        required: true
+        default: 'supulvinod/pro-nxt'
+        type: string
+      branch:
+        description: 'Branch to build'
+        required: false
+        default: 'main'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Resolve source target
+        run: |
+          SOURCE_REPO="${{ github.event.inputs.source_repo || github.event.client_payload.source_repo || 'supulvinod/pro-nxt' }}"
+          SOURCE_BRANCH="${{ github.event.inputs.branch || github.event.client_payload.branch || 'main' }}"
+          echo "SOURCE_REPO=$SOURCE_REPO" >> "$GITHUB_ENV"
+          echo "SOURCE_BRANCH=$SOURCE_BRANCH" >> "$GITHUB_ENV"
+          echo "Deploying shop Flutter web from $SOURCE_REPO@$SOURCE_BRANCH → Cloudflare Pages (spacenxt-app)"
+
+      - name: Clone source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_BRANCH }}
+          token: ${{ secrets.SOURCE_REPO_PAT || github.token }}
+          fetch-depth: 1
+          sparse-checkout: |
+            shop/flutter-shop
+            packages/spacenxt_ops_ui
+          sparse-checkout-cone-mode: true
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          cache-key: flutter-shop-${{ hashFiles('shop/flutter-shop/pubspec.lock') }}
+
+      - name: Build Flutter Web
+        working-directory: shop/flutter-shop
+        run: |
+          flutter pub get
+          flutter build web --release --base-href /
+          cp web/_redirects build/web/_redirects
+          cp web/_headers build/web/_headers
+
+      - name: Deploy to Cloudflare Pages (app.spacenxt.lk)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy shop/flutter-shop/build/web --project-name spacenxt-app --branch main

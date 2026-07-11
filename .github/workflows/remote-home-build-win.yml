@@ -311,7 +311,10 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{"step":"compiling","stepLabel":"Compiling Windows app..."}' &
 
-          flutter build windows --release --suppress-analytics 2>&1 | /tmp/stream_log.sh "compile"
+          flutter build windows --release --suppress-analytics \
+            --dart-define=RH_DEVICE_PROVISIONING_API_BASE_URL=https://us-central1-spacenxt-app.cloudfunctions.net \
+            --dart-define=RH_ENABLE_COMMAND_API=true \
+            2>&1 | /tmp/stream_log.sh "compile"
           echo "✅ Flutter Windows build completed"
 
       # ----- Package as ZIP -----

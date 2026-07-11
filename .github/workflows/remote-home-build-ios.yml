@@ -465,7 +465,7 @@ jobs:
             done
           fi
 
-      # ----- Build unsigned IPA -----
+      # ----- Build unsigned iOS app (no IPA export; avoids Development Team requirement) -----
       - name: Build Flutter iOS (no codesign)
         shell: bash
         env:
@@ -477,9 +477,11 @@ jobs:
           curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
             -H "Content-Type: application/json" \
             -d '{"step":"compiling","stepLabel":"Compiling iOS app..."}' &
-          
-          # Stream ALL build logs to Firebase in real-time
-          flutter build ipa --release --no-codesign --no-tree-shake-icons --suppress-analytics \
+
+          # Use `build ios` (not `build ipa`) so Flutter 3.44+ does not require a
+          # Development Team / provisioning profile for unsigned CI artifacts.
+          set -o pipefail
+          flutter build ios --release --no-codesign --no-tree-shake-icons --suppress-analytics \
             --dart-define=RH_DEVICE_PROVISIONING_API_BASE_URL=https://us-central1-spacenxt-app.cloudfunctions.net \
             --dart-define=RH_ENABLE_COMMAND_API=true \
             2>&1 | while IFS= read -r line; do
@@ -489,7 +491,7 @@ jobs:
               -H "Content-Type: application/json" \
               -d "{\"step\":\"compile\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
           done
-          echo "✅ Flutter iOS archive build completed"
+          echo "✅ Flutter iOS release build completed"
 
       - name: Create unsigned IPA from archive
         env:
@@ -502,13 +504,17 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{"step":"packaging","stepLabel":"Creating IPA..."}' &
           mkdir -p build/ios/ipa
-          # Extract .app from xcarchive and package as IPA
+          # Prefer xcarchive (legacy ipa path), else unsigned ios release .app
           APP_PATH="build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app"
           if [ ! -d "$APP_PATH" ]; then
-            echo "❌ Runner.app not found in archive!"
-            find build/ios/archive -name "*.app" -type d 2>/dev/null || true
+            APP_PATH="build/ios/iphoneos/Runner.app"
+          fi
+          if [ ! -d "$APP_PATH" ]; then
+            echo "❌ Runner.app not found!"
+            find build/ios -name "Runner.app" -type d 2>/dev/null || true
             exit 1
           fi
+          echo "Using APP_PATH=$APP_PATH"
           
           # ----- Inject loose icon PNGs into .app bundle for ESign/Feather -----
           # Modern Xcode compiles icons into Assets.car (binary), but sideloading

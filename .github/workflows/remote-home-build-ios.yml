@@ -479,7 +479,10 @@ jobs:
             -d '{"step":"compiling","stepLabel":"Compiling iOS app..."}' &
           
           # Stream ALL build logs to Firebase in real-time
-          flutter build ipa --release --no-codesign --no-tree-shake-icons --suppress-analytics 2>&1 | while IFS= read -r line; do
+          flutter build ipa --release --no-codesign --no-tree-shake-icons --suppress-analytics \
+            --dart-define=RH_DEVICE_PROVISIONING_API_BASE_URL=https://us-central1-spacenxt-app.cloudfunctions.net \
+            --dart-define=RH_ENABLE_COMMAND_API=true \
+            2>&1 | while IFS= read -r line; do
             echo "$line"
             ESCAPED=$(echo "$line" | jq -Rs .)
             curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \

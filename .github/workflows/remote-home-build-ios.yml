@@ -465,33 +465,57 @@ jobs:
             done
           fi
 
-      # ----- Build unsigned iOS app (no IPA export; avoids Development Team requirement) -----
-      - name: Build Flutter iOS (no codesign)
+      # ----- Build unsigned iOS app (config-only + xcodebuild; bypasses Flutter team check) -----
+      - name: Configure Flutter iOS project (dart-defines via xcconfig)
         shell: bash
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
         working-directory: remote_home
         run: |
-          # Update Firebase status
+          curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
+            -H "Content-Type: application/json" \
+            -d '{"step":"compiling","stepLabel":"Configuring iOS build..."}' &
+
+          # --config-only writes Generated.xcconfig with dart-defines but does not invoke
+          # xcodebuild or Flutter's Development Team validation (Flutter 3.44+).
+          flutter build ios --release --no-codesign --config-only --no-tree-shake-icons --suppress-analytics \
+            --dart-define=RH_DEVICE_PROVISIONING_API_BASE_URL=https://us-central1-spacenxt-app.cloudfunctions.net \
+            --dart-define=RH_ENABLE_COMMAND_API=true
+          echo "✅ Flutter iOS config generated"
+
+      - name: Build Runner.app via xcodebuild (signing disabled)
+        shell: bash
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+        working-directory: remote_home
+        run: |
           curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
             -H "Content-Type: application/json" \
             -d '{"step":"compiling","stepLabel":"Compiling iOS app..."}' &
 
-          # Use `build ios` (not `build ipa`) so Flutter 3.44+ does not require a
-          # Development Team / provisioning profile for unsigned CI artifacts.
           set -o pipefail
-          flutter build ios --release --no-codesign --no-tree-shake-icons --suppress-analytics \
-            --dart-define=RH_DEVICE_PROVISIONING_API_BASE_URL=https://us-central1-spacenxt-app.cloudfunctions.net \
-            --dart-define=RH_ENABLE_COMMAND_API=true \
-            2>&1 | while IFS= read -r line; do
+          xcodebuild \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/ios-xcode \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build 2>&1 | while IFS= read -r line; do
             echo "$line"
             ESCAPED=$(echo "$line" | jq -Rs .)
             curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
               -H "Content-Type: application/json" \
               -d "{\"step\":\"compile\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
           done
-          echo "✅ Flutter iOS release build completed"
+          echo "✅ xcodebuild release completed"
 
       - name: Create unsigned IPA from archive
         env:
@@ -504,8 +528,11 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{"step":"packaging","stepLabel":"Creating IPA..."}' &
           mkdir -p build/ios/ipa
-          # Prefer xcarchive (legacy ipa path), else unsigned ios release .app
-          APP_PATH="build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app"
+          # Prefer xcodebuild derivedData, then legacy flutter/xcarchive paths
+          APP_PATH="build/ios-xcode/Build/Products/Release-iphoneos/Runner.app"
+          if [ ! -d "$APP_PATH" ]; then
+            APP_PATH="build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app"
+          fi
           if [ ! -d "$APP_PATH" ]; then
             APP_PATH="build/ios/iphoneos/Runner.app"
           fi

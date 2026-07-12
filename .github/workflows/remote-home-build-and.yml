@@ -89,31 +89,45 @@ jobs:
           # Define stream_log helper
           cat > /tmp/stream_log.sh << 'LOGFUNC'
           #!/bin/bash
+          # Batched Firebase log stream (avoid per-line curl during Flutter compile).
+          # Flutter emits many "[  +N ms]" ticks that previously matched ^\[ and flooded RTDB.
           STEP_NAME="$1"
           LOG_BUFFER=""
           LINE_COUNT=0
-          while IFS= read -r line; do
-            echo "$line"
-            if [ "$ENABLE_LOGGING" != "true" ]; then continue; fi
-            LOG_BUFFER="${LOG_BUFFER}${line}\n"
-            LINE_COUNT=$((LINE_COUNT + 1))
-            if [ $LINE_COUNT -ge 10 ] || echo "$line" | grep -qE '^\[|✅|❌|⚠️|Error|error:|warning:'; then
-              if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ] && [ -n "$PENDING_ID" ]; then
-                ESCAPED=$(echo -e "$LOG_BUFFER" | jq -Rs .)
-                curl -sf -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
-                  -H "Content-Type: application/json" \
-                  -d "{\"step\":\"${STEP_NAME}\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
-              fi
+          LAST_FLUSH=$(date +%s)
+          flush_logs() {
+            if [ -z "$LOG_BUFFER" ]; then return 0; fi
+            if [ "${ENABLE_LOGGING:-true}" != "true" ]; then
               LOG_BUFFER=""
               LINE_COUNT=0
+              LAST_FLUSH=$(date +%s)
+              return 0
+            fi
+            if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ] && [ -n "$PENDING_ID" ]; then
+              while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge 4 ]; do sleep 0.05; done
+              ESCAPED=$(echo -e "$LOG_BUFFER" | jq -Rs .)
+              curl -sf -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+                -H "Content-Type: application/json" \
+                -d "{\"step\":\"${STEP_NAME}\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+            fi
+            LOG_BUFFER=""
+            LINE_COUNT=0
+            LAST_FLUSH=$(date +%s)
+          }
+          while IFS= read -r line; do
+            echo "$line"
+            if [ "${ENABLE_LOGGING:-true}" != "true" ]; then continue; fi
+            # Drop noisy Flutter progress ticks; keep real output.
+            if echo "$line" | grep -qE '^\[\s*\+[0-9]'; then continue; fi
+            LOG_BUFFER="${LOG_BUFFER}${line}\n"
+            LINE_COUNT=$((LINE_COUNT + 1))
+            NOW=$(date +%s)
+            if [ "$LINE_COUNT" -ge 40 ] || [ $((NOW - LAST_FLUSH)) -ge 3 ] || echo "$line" | grep -qE '✅|❌|⚠️|Error:|FAILURE|Built |✓ Built|Compiling'; then
+              flush_logs
             fi
           done
-          if [ -n "$LOG_BUFFER" ] && [ "$ENABLE_LOGGING" = "true" ] && [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ] && [ -n "$PENDING_ID" ]; then
-            ESCAPED=$(echo -e "$LOG_BUFFER" | jq -Rs .)
-            curl -sf -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
-              -H "Content-Type: application/json" \
-              -d "{\"step\":\"${STEP_NAME}\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 || true
-          fi
+          flush_logs
+          wait 2>/dev/null || true
           LOGFUNC
           chmod +x /tmp/stream_log.sh
 
@@ -195,6 +209,7 @@ jobs:
           fetch-depth: 1
           sparse-checkout: |
             remote_home
+            packages/spacenxt_ops_ui
           sparse-checkout-cone-mode: true
 
       - name: Log checkout complete
@@ -217,6 +232,7 @@ jobs:
         with:
           channel: stable
           cache: true
+          cache-key: flutter-remotehome-and-${{ runner.os }}-stable
 
       - name: Flutter version
         env:
@@ -319,11 +335,12 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
-      # ----- Build APK -----
+      # ----- Build APK (arm64-only CI artifact; store lane can still ship universal/AAB) -----
       - name: Build Flutter APK
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+          GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.caching=true
         working-directory: remote_home
         run: |
           curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
@@ -331,6 +348,7 @@ jobs:
             -d '{"step":"compiling","stepLabel":"Compiling Android app..."}' &
 
           flutter build apk --release --no-tree-shake-icons --suppress-analytics \
+            --target-platform=android-arm64 \
             --dart-define=RH_DEVICE_PROVISIONING_API_BASE_URL=https://us-central1-spacenxt-app.cloudfunctions.net \
             --dart-define=RH_ENABLE_COMMAND_API=true \
             2>&1 | /tmp/stream_log.sh "compile"

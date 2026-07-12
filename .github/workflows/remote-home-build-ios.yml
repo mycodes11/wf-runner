@@ -67,35 +67,47 @@ jobs:
           # Creates buildLogs/{PENDING_ID} with live output
           cat > /tmp/stream_log.sh << 'LOGFUNC'
           #!/bin/bash
-          # Stream logs to Firebase in real-time
-          # Usage: some_command 2>&1 | stream_log "step_name"
+          # Batched Firebase log stream (avoid per-line curl during Flutter/xcodebuild).
+          # Flutter "[  +N ms]" ticks and raw xcodebuild clang chatter flooded RTDB and slowed the pipe.
           STEP_NAME="$1"
           LOG_BUFFER=""
           LINE_COUNT=0
-          while IFS= read -r line; do
-            echo "$line"  # Still output to console
-            LOG_BUFFER="${LOG_BUFFER}${line}\n"
-            LINE_COUNT=$((LINE_COUNT + 1))
-            # Flush to Firebase every 10 lines or if line contains key markers
-            if [ $LINE_COUNT -ge 10 ] || echo "$line" | grep -qE '^\[|✅|❌|⚠️|Error|error:|warning:'; then
-              if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ] && [ -n "$PENDING_ID" ]; then
-                # Append to logs array
-                ESCAPED=$(echo -e "$LOG_BUFFER" | jq -Rs .)
-                curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
-                  -H "Content-Type: application/json" \
-                  -d "{\"step\":\"${STEP_NAME}\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
-              fi
+          LAST_FLUSH=$(date +%s)
+          flush_logs() {
+            if [ -z "$LOG_BUFFER" ]; then return 0; fi
+            if [ "${ENABLE_LOGGING:-true}" != "true" ]; then
               LOG_BUFFER=""
               LINE_COUNT=0
+              LAST_FLUSH=$(date +%s)
+              return 0
+            fi
+            if [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ] && [ -n "$PENDING_ID" ]; then
+              while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge 4 ]; do sleep 0.05; done
+              ESCAPED=$(echo -e "$LOG_BUFFER" | jq -Rs .)
+              curl -sf -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
+                -H "Content-Type: application/json" \
+                -d "{\"step\":\"${STEP_NAME}\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
+            fi
+            LOG_BUFFER=""
+            LINE_COUNT=0
+            LAST_FLUSH=$(date +%s)
+          }
+          while IFS= read -r line; do
+            echo "$line"
+            if [ "${ENABLE_LOGGING:-true}" != "true" ]; then continue; fi
+            # Drop Flutter progress ticks and verbose xcodebuild tool chatter.
+            if echo "$line" | grep -qE '^\[\s*\+[0-9]'; then continue; fi
+            if echo "$line" | grep -qE '^(CompileC|CompileSwift|SwiftCompile|Ld |Libtool|ProcessInfoPlistFile|CopyPNGFile|CpResource|CodeSign|Builtin-|PhaseScriptExecution|ScanDependencies|PrecompileModule|VerifyModule|Touch |Strip |SetOwnerAndGroup|SetMode|RegisterExecutionPolicyException) '; then continue; fi
+            if echo "$line" | grep -qE '^[[:space:]]+(/Applications/Xcode|/usr/bin/|/bin/|cd |export |builtin-)'; then continue; fi
+            LOG_BUFFER="${LOG_BUFFER}${line}\n"
+            LINE_COUNT=$((LINE_COUNT + 1))
+            NOW=$(date +%s)
+            if [ "$LINE_COUNT" -ge 40 ] || [ $((NOW - LAST_FLUSH)) -ge 3 ] || echo "$line" | grep -qE '✅|❌|⚠️|Error:|error:|FAILURE|BUILD SUCCEEDED|BUILD FAILED|Built |✓ Built|Compiling'; then
+              flush_logs
             fi
           done
-          # Flush remaining
-          if [ -n "$LOG_BUFFER" ] && [ -n "$FIREBASE_DATABASE_URL" ] && [ -n "$FIREBASE_AUTH" ] && [ -n "$PENDING_ID" ]; then
-            ESCAPED=$(echo -e "$LOG_BUFFER" | jq -Rs .)
-            curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
-              -H "Content-Type: application/json" \
-              -d "{\"step\":\"${STEP_NAME}\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 || true
-          fi
+          flush_logs
+          wait 2>/dev/null || true
           LOGFUNC
           chmod +x /tmp/stream_log.sh
 
@@ -315,14 +327,7 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{"step":"dependencies","stepLabel":"Getting dependencies..."}' &
           
-          # Stream ALL pub get output
-          flutter pub get 2>&1 | while IFS= read -r line; do
-            echo "$line"
-            ESCAPED=$(echo "$line" | jq -Rs .)
-            curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
-              -H "Content-Type: application/json" \
-              -d "{\"step\":\"deps\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
-          done
+          flutter pub get 2>&1 | /tmp/stream_log.sh "deps"
 
       # ----- Generate app icons for iOS (skip if already generated) -----
       - name: Generate iOS app icons
@@ -455,14 +460,7 @@ jobs:
               -d '{"step":"pods","text":"✅ Pods cache valid, skipping install","ts":'$(date +%s000)'}' > /dev/null 2>&1 &
           else
             echo "🔄 Installing pods..."
-            # Stream ALL pod install output
-            (pod install --deployment --no-repo-update 2>&1 || pod install --no-repo-update 2>&1 || pod install 2>&1) | while IFS= read -r line; do
-              echo "$line"
-              ESCAPED=$(echo "$line" | jq -Rs .)
-              curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
-                -H "Content-Type: application/json" \
-                -d "{\"step\":\"pods\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
-            done
+            (pod install --deployment --no-repo-update 2>&1 || pod install --no-repo-update 2>&1 || pod install 2>&1) | /tmp/stream_log.sh "pods"
           fi
 
       # ----- Build unsigned iOS app (config-only + xcodebuild; bypasses Flutter team check) -----
@@ -496,25 +494,25 @@ jobs:
             -d '{"step":"compiling","stepLabel":"Compiling iOS app..."}' &
 
           set -o pipefail
+          # CI flags: skip index store, arm64-only device slice. Stream via batched logger —
+          # raw xcodebuild is extremely verbose and per-line Firebase curls dominated this step.
           xcodebuild \
             -workspace ios/Runner.xcworkspace \
             -scheme Runner \
             -configuration Release \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build/ios-xcode \
+            -jobs "$(sysctl -n hw.ncpu)" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
             DEVELOPMENT_TEAM="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            build 2>&1 | while IFS= read -r line; do
-            echo "$line"
-            ESCAPED=$(echo "$line" | jq -Rs .)
-            curl -s -X POST "${FIREBASE_DATABASE_URL}/buildLogs/${PENDING_ID}/lines.json?auth=${FIREBASE_AUTH}" \
-              -H "Content-Type: application/json" \
-              -d "{\"step\":\"compile\",\"text\":${ESCAPED},\"ts\":$(date +%s000)}" > /dev/null 2>&1 &
-          done
+            build 2>&1 | /tmp/stream_log.sh "compile"
           echo "✅ xcodebuild release completed"
 
       - name: Create unsigned IPA from archive

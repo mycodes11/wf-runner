@@ -463,30 +463,17 @@ jobs:
             (pod install --deployment --no-repo-update 2>&1 || pod install --no-repo-update 2>&1 || pod install 2>&1) | /tmp/stream_log.sh "pods"
           fi
 
-      # ----- Build unsigned iOS app (config-only + xcodebuild; bypasses Flutter team check) -----
-      - name: Configure Flutter iOS project (dart-defines via xcconfig)
+      # ----- Build unsigned IPA (same path as Workflow Manager: flutter build ios) -----
+      - name: Build iOS (unsigned)
         shell: bash
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
-        working-directory: remote_home
-        run: |
-          curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
-            -H "Content-Type: application/json" \
-            -d '{"step":"compiling","stepLabel":"Configuring iOS build..."}' &
-
-          # --config-only writes Generated.xcconfig with dart-defines but does not invoke
-          # xcodebuild or Flutter's Development Team validation (Flutter 3.44+).
-          flutter build ios --release --no-codesign --config-only --no-tree-shake-icons --suppress-analytics \
-            --dart-define=RH_DEVICE_PROVISIONING_API_BASE_URL=https://us-central1-spacenxt-app.cloudfunctions.net \
-            --dart-define=RH_ENABLE_COMMAND_API=true
-          echo "✅ Flutter iOS config generated"
-
-      - name: Build Runner.app via xcodebuild (signing disabled)
-        shell: bash
-        env:
-          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
-          FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
+          FLUTTER_XCODE_CODE_SIGNING_ALLOWED: NO
+          FLUTTER_XCODE_CODE_SIGNING_REQUIRED: NO
+          FLUTTER_XCODE_CODE_SIGN_IDENTITY: ""
+          # Flutter fails after xcodebuild when DEVELOPMENT_TEAM is unset, even with --no-codesign
+          FLUTTER_XCODE_DEVELOPMENT_TEAM: ""
         working-directory: remote_home
         run: |
           curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
@@ -494,57 +481,37 @@ jobs:
             -d '{"step":"compiling","stepLabel":"Compiling iOS app..."}' &
 
           set -o pipefail
-          # CI flags: skip index store, arm64-only device slice. Stream via batched logger —
-          # raw xcodebuild is extremely verbose and per-line Firebase curls dominated this step.
-          xcodebuild \
-            -workspace ios/Runner.xcworkspace \
-            -scheme Runner \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build/ios-xcode \
-            -jobs "$(sysctl -n hw.ncpu)" \
-            COMPILER_INDEX_STORE_ENABLE=NO \
-            ONLY_ACTIVE_ARCH=YES \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGN_ENTITLEMENTS="" \
-            DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            build 2>&1 | /tmp/stream_log.sh "compile"
-          echo "✅ xcodebuild release completed"
+          flutter build ios --release --no-codesign --no-tree-shake-icons --suppress-analytics \
+            --dart-define=RH_DEVICE_PROVISIONING_API_BASE_URL=https://us-central1-spacenxt-app.cloudfunctions.net \
+            --dart-define=RH_ENABLE_COMMAND_API=true \
+            2>&1 | /tmp/stream_log.sh "compile"
+          echo "✅ Flutter iOS build completed"
 
-      - name: Create unsigned IPA from archive
+      - name: Create IPA
         env:
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           FIREBASE_AUTH: ${{ secrets.FIREBASE_DATABASE_SECRET }}
         working-directory: remote_home
         run: |
-          # Update Firebase status
           curl -s -X PATCH "${FIREBASE_DATABASE_URL}/buildReleases/${PENDING_ID}.json?auth=${FIREBASE_AUTH}" \
             -H "Content-Type: application/json" \
             -d '{"step":"packaging","stepLabel":"Creating IPA..."}' &
-          mkdir -p build/ios/ipa
-          # Prefer xcodebuild derivedData, then legacy flutter/xcarchive paths
-          APP_PATH="build/ios-xcode/Build/Products/Release-iphoneos/Runner.app"
-          if [ ! -d "$APP_PATH" ]; then
-            APP_PATH="build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app"
-          fi
-          if [ ! -d "$APP_PATH" ]; then
-            APP_PATH="build/ios/iphoneos/Runner.app"
-          fi
-          if [ ! -d "$APP_PATH" ]; then
-            echo "❌ Runner.app not found!"
-            find build/ios -name "Runner.app" -type d 2>/dev/null || true
+
+          APP_PATH=$(find build/ios -type d -name Runner.app \
+            \( -path "*/Release-iphoneos/*" -o -path "*/iphoneos/*" -o -path "*/Runner.xcarchive/Products/Applications/*" \) \
+            -print -quit)
+          ICON_SRC="assets/icon/app_icon_ios.png"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ Runner.app not found under remote_home/build/ios"
+            find build/ios -maxdepth 4 -type d 2>/dev/null | sort | tail -n 50
             exit 1
           fi
-          echo "Using APP_PATH=$APP_PATH"
-          
+          echo "✅ Using app bundle: $APP_PATH"
+
           # ----- Inject loose icon PNGs into .app bundle for ESign/Feather -----
           # Modern Xcode compiles icons into Assets.car (binary), but sideloading
           # tools need loose PNG files matching CFBundleIconFiles entries.
-          ICON_SRC="assets/icon/app_icon_ios.png"
           if [ -f "$ICON_SRC" ]; then
             echo "🎨 Injecting icon PNGs into Runner.app for sideloading tools..."
             sips -z 120 120 "$ICON_SRC" --out "$APP_PATH/AppIcon60x60@2x.png" > /dev/null 2>&1 || true
@@ -555,19 +522,23 @@ jobs:
           else
             echo "  ⚠️ Source icon not found at $ICON_SRC"
           fi
-          
-          mkdir -p /tmp/Payload
-          cp -r "$APP_PATH" /tmp/Payload/
-          
+
+          mkdir -p build/ios/Payload
+          cp -r "$APP_PATH" build/ios/Payload/
+
           # Copy iTunesArtwork for sideloading tools (ESign/Feather library icon)
           if [ -f "$ICON_SRC" ]; then
-            cp "$ICON_SRC" /tmp/iTunesArtwork
+            cp "$ICON_SRC" build/ios/iTunesArtwork
             echo "✅ iTunesArtwork added from source dark icon"
           fi
-          
-          cd /tmp && zip -qr "$GITHUB_WORKSPACE/remote_home/build/ios/ipa/remote-home-unsigned.ipa" Payload iTunesArtwork 2>/dev/null || zip -qr "$GITHUB_WORKSPACE/remote_home/build/ios/ipa/remote-home-unsigned.ipa" Payload
-          rm -rf /tmp/Payload /tmp/iTunesArtwork
-          echo "✅ IPA created: $(du -h $GITHUB_WORKSPACE/remote_home/build/ios/ipa/remote-home-unsigned.ipa | cut -f1)"
+
+          mkdir -p build/ios/ipa
+          (
+            cd build/ios
+            zip -qr ipa/remote-home-unsigned.ipa Payload iTunesArtwork 2>/dev/null \
+              || zip -qr ipa/remote-home-unsigned.ipa Payload
+          )
+          echo "✅ IPA created: $(du -h build/ios/ipa/remote-home-unsigned.ipa | cut -f1)"
 
       # ----- Upload IPA as a release artifact to PUBLIC repo -----
       - name: Upload unsigned IPA
